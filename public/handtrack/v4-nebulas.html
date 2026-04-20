@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Nebula Generator — Hand Tracking</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #04050f;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    color: #fff;
+  }
+  #webcam { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  canvas { display: block; }
+  #title {
+    position: fixed; top: 20px; left: 120px;
+    font-size: 13px; letter-spacing: 0.25em; color: #aaa;
+    z-index: 10; pointer-events: none;
+  }
+  #hint {
+    position: fixed; top: 20px; right: 30px;
+    font-size: 10px; letter-spacing: 0.15em; color: #666;
+    z-index: 10; pointer-events: none; text-align: right; line-height: 1.7;
+  }
+  #debugLog {
+    position: fixed; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #0f0;
+    padding: 6px 10px; border: 1px solid #333;
+    font-size: 10px; white-space: pre; z-index: 200;
+    max-width: 320px; line-height: 1.5;
+  }
+  #startBtn {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: #fff; color: #000; border: none;
+    padding: 20px 40px; font-size: 16px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 150;
+  }
+  #menuLink {
+    position: fixed; top: 14px; left: 14px;
+    z-index: 250; font: 10px 'Courier New', monospace;
+    letter-spacing: 0.2em; color: #888;
+    text-decoration: none; border: 1px solid #333;
+    padding: 6px 10px; background: rgba(0,0,0,0.4);
+  }
+  #recBtn, #camBtn, #clearBtn {
+    position: fixed; bottom: 16px;
+    background: transparent; color: #fff;
+    border: 1px solid #555;
+    padding: 8px 18px; font-size: 11px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 25;
+    transition: all 0.15s;
+  }
+  #camBtn   { left: 50%; transform: translateX(calc(-150% - 20px)); }
+  #clearBtn { left: 50%; transform: translateX(-50%); }
+  #recBtn   { left: 50%; transform: translateX(calc(50% + 20px)); }
+  #recBtn.recording { background: #432; border-color: #f44; color: #fff; }
+  #camBtn.active    { background: #252; border-color: #5e5; }
+  #clearBtn:hover, #recBtn:hover, #camBtn:hover { border-color: #aaa; }
+  #recFmt {
+    position: fixed; bottom: 18px; right: 16px;
+    font: 9px monospace; color: #555;
+    letter-spacing: 0.2em; z-index: 25;
+  }
+</style>
+</head>
+<body>
+  <a href="index.html" id="menuLink">← MENU</a>
+  <video id="webcam" autoplay playsinline muted></video>
+  <div id="title">NEBULA GENERATOR</div>
+  <div id="hint">
+    HOLD FIST (0.3s) → OPEN HAND<br/>
+    BIRTHS A REAL DEEP-SKY OBJECT
+  </div>
+  <div id="debugLog">booting...</div>
+  <button id="startBtn">▶ START</button>
+  <button id="camBtn" style="display:none">◐ CAM OFF</button>
+  <button id="clearBtn" style="display:none">✸ CLEAR COSMOS</button>
+  <button id="recBtn" style="display:none">● RECORD</button>
+  <div id="recFmt"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+
+  <script type="module">
+    const dbg = document.getElementById("debugLog");
+    const btn = document.getElementById("startBtn");
+    const logs = [];
+    function log(msg) {
+      logs.push(msg);
+      if (logs.length > 10) logs.shift();
+      dbg.innerText = logs.join("\n");
+      console.log("[boot]", msg);
+    }
+    window.addEventListener("error", (e) => log("ERR: " + e.message));
+    window.addEventListener("unhandledrejection", (e) => log("PROMISE ERR: " + (e.reason?.message || e.reason)));
+
+    const state = {
+      video: null,
+      hands: [],
+      handInfos: [],
+      mpReady: false,
+      nebulas: [],
+      camOn: false,
+      lastSpawnedIndex: -1
+    };
+
+    // ==================== Real deep-sky catalogue ====================
+    // Each entry mirrors distinctive morphology + color of the real object.
+    // hueA = primary/emission color, hueB = secondary/reflection color.
+    const REAL_OBJECTS = [
+      { name: "M31 · ANDROMEDA",    type: "tiltedSpiral", hueA:  48, hueB: 215, size: 220 },
+      { name: "M42 · ORION NEBULA", type: "emissionFan",  hueA: 340, hueB: 205, size: 170 },
+      { name: "M51 · WHIRLPOOL",    type: "spiralTwoArm", hueA:  32, hueB: 205, size: 180, hasCompanion: true },
+      { name: "M57 · RING NEBULA",  type: "ring",         hueA: 175, hueB:  18, size: 120 },
+      { name: "M1 · CRAB NEBULA",   type: "filament",     hueA:  20, hueB: 200, size: 150 },
+      { name: "M45 · PLEIADES",     type: "openCluster",  hueA: 210, hueB: 232, size: 170 },
+      { name: "M104 · SOMBRERO",    type: "edgeOn",       hueA:  42, hueB: 225, size: 200 },
+      { name: "M13 · HERCULES",     type: "globular",     hueA:  48, hueB:  28, size: 130 },
+      { name: "NGC 7293 · HELIX",   type: "helixEye",     hueA: 180, hueB:  12, size: 140 },
+      { name: "M16 · EAGLE NEBULA", type: "emissionFan",  hueA:  18, hueB: 195, size: 180 },
+      { name: "M8 · LAGOON",        type: "emissionFan",  hueA: 345, hueB: 210, size: 170 },
+      { name: "M81 · BODE GALAXY",  type: "spiralTwoArm", hueA:  40, hueB: 210, size: 170 }
+    ];
+
+    function rand(a, b) { return a + Math.random() * (b - a); }
+
+    function mkStar(x, y, hue, brightness, isBright) {
+      return {
+        x, y, hue,
+        size: 0.45 + Math.random() * 1.9 + (isBright ? 1.2 : 0),
+        brightness,
+        phase: Math.random() * Math.PI * 2
+      };
+    }
+
+    // ========== Morphology generators ==========
+    const genFor = {
+      tiltedSpiral: (o) => {
+        const parts = [];
+        const tilt  = 0.38;
+        // yellow dense core
+        for (let i = 0; i < 55; i++) {
+          const r = Math.sqrt(Math.random()) * o.size * 0.22;
+          const a = Math.random() * Math.PI * 2;
+          const bright = Math.random() < 0.08;
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r * tilt,
+                            o.hueA + rand(-10, 10), 0.55 + Math.random() * 0.4, bright));
+        }
+        // bluish arms
+        for (let arm = 0; arm < 2; arm++) {
+          const offset = arm * Math.PI;
+          for (let i = 0; i < 70; i++) {
+            const t = i / 70;
+            const angle = offset + t * Math.PI * 1.9 + rand(-0.2, 0.2);
+            const r = t * o.size * 0.5 + rand(0, 12);
+            parts.push(mkStar(Math.cos(angle) * r, Math.sin(angle) * r * tilt,
+                              o.hueB + rand(-18, 18), 0.35 + Math.random() * 0.55,
+                              Math.random() < 0.04));
+          }
+        }
+        return { parts, radius: o.size * 0.6 };
+      },
+
+      emissionFan: (o) => {
+        const parts = [];
+        // two asymmetric lobes
+        for (let lobe = 0; lobe < 2; lobe++) {
+          const offset    = lobe === 0 ? 0 : Math.PI;
+          const intensity = lobe === 0 ? 1.0 : 0.55;
+          const n         = Math.floor(80 * intensity);
+          for (let i = 0; i < n; i++) {
+            const a = offset + (Math.random() - 0.5) * Math.PI * 0.75;
+            const r = Math.pow(Math.random(), 0.5) * o.size * 0.45;
+            const useA = Math.random() < 0.72;
+            parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r * (0.8 + Math.random() * 0.4),
+                              (useA ? o.hueA : o.hueB) + rand(-12, 12),
+                              0.35 + Math.random() * 0.5, false));
+          }
+        }
+        // trapezium-like bright central cluster
+        for (let i = 0; i < 5; i++) {
+          parts.push(mkStar(rand(-18, 18), rand(-14, 14), o.hueA + 10, 0.95, true));
+        }
+        return { parts, radius: o.size * 0.55 };
+      },
+
+      spiralTwoArm: (o) => {
+        const parts = [];
+        // face-on tight spiral
+        for (let arm = 0; arm < 2; arm++) {
+          const offset = arm * Math.PI;
+          for (let i = 0; i < 62; i++) {
+            const t = i / 62;
+            const angle = offset + t * Math.PI * 2.4 + rand(-0.14, 0.14);
+            const r = t * o.size * 0.48;
+            parts.push(mkStar(Math.cos(angle) * r, Math.sin(angle) * r,
+                              (Math.random() < 0.28 ? o.hueA : o.hueB) + rand(-12, 12),
+                              0.35 + Math.random() * 0.55,
+                              Math.random() < 0.07));
+          }
+        }
+        // core
+        for (let i = 0; i < 28; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.sqrt(Math.random()) * 18;
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r,
+                            o.hueA + rand(-8, 8), 0.8 + Math.random() * 0.2, true));
+        }
+        // companion galaxy if applicable
+        if (o.hasCompanion) {
+          const ccx = o.size * 0.36, ccy = -o.size * 0.08;
+          for (let i = 0; i < 32; i++) {
+            const r = Math.sqrt(Math.random()) * 20;
+            const a = Math.random() * Math.PI * 2;
+            parts.push(mkStar(ccx + Math.cos(a) * r, ccy + Math.sin(a) * r,
+                              o.hueA + rand(-10, 10), 0.45 + Math.random() * 0.35,
+                              Math.random() < 0.1));
+          }
+        }
+        return { parts, radius: o.size * 0.7 };
+      },
+
+      ring: (o) => {
+        const parts = [];
+        const R = o.size * 0.48;
+        // outer red ring
+        for (let i = 0; i < 75; i++) {
+          const a = (i / 75) * Math.PI * 2 + rand(-0.04, 0.04);
+          const r = R + rand(-5, 5);
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r * 0.8,
+                            o.hueB + rand(-10, 10), 0.55 + Math.random() * 0.35, false));
+        }
+        // inner blue-green fill
+        for (let i = 0; i < 35; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.random() * R * 0.65;
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r * 0.8,
+                            o.hueA + rand(-10, 10), 0.25 + Math.random() * 0.4, false));
+        }
+        parts.push(mkStar(0, 0, 50, 1.0, true));    // central white dwarf
+        return { parts, radius: R + 10 };
+      },
+
+      filament: (o) => {
+        const parts = [];
+        const R = o.size * 0.45;
+        // elongated chaotic oval
+        for (let i = 0; i < 100; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.sqrt(Math.random()) * R;
+          const x = Math.cos(a) * r * 1.25;
+          const y = Math.sin(a) * r * 0.7;
+          const h = (Math.random() < 0.65 ? o.hueA : o.hueB) + rand(-10, 10);
+          parts.push(mkStar(x, y, h, 0.3 + Math.random() * 0.55,
+                            Math.random() < 0.04));
+        }
+        parts.push(mkStar(0, 0, o.hueB, 1.0, true));  // pulsar
+        return { parts, radius: R * 1.3 };
+      },
+
+      openCluster: (o) => {
+        // Pleiades: 7 bright + nebulosity
+        const parts = [];
+        const brightStars = [
+          { x: -46, y: -22 }, { x: 22, y: -38 },
+          { x: 48, y: 2 },    { x: 0, y: 12 },
+          { x: -22, y: 28 },  { x: 30, y: 34 },
+          { x: -54, y: 6 }
+        ];
+        for (const bs of brightStars) {
+          parts.push(mkStar(bs.x, bs.y, o.hueA + rand(-8, 8), 1.0, true));
+        }
+        // blue nebulosity
+        for (let i = 0; i < 90; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.pow(Math.random(), 0.7) * o.size * 0.45;
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r,
+                            o.hueB + rand(-18, 18),
+                            0.15 + Math.random() * 0.35, false));
+        }
+        return { parts, radius: o.size * 0.55 };
+      },
+
+      edgeOn: (o) => {
+        const parts = [];
+        const R = o.size * 0.5;
+        // very flat disk (aspect ~1 : 4.5)
+        for (let i = 0; i < 90; i++) {
+          const x = (Math.random() - 0.5) * R * 1.9;
+          const y = (Math.random() - 0.5) * R * 0.26;
+          parts.push(mkStar(x, y,
+                            (Math.random() < 0.35 ? o.hueA : o.hueB) + rand(-10, 10),
+                            0.3 + Math.random() * 0.5, Math.random() < 0.04));
+        }
+        // bulge/core (vertically taller)
+        for (let i = 0; i < 35; i++) {
+          const a = Math.random() * Math.PI * 2;
+          const r = Math.sqrt(Math.random()) * 18;
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r * 0.55,
+                            o.hueA + rand(-6, 6), 0.85 + Math.random() * 0.15, true));
+        }
+        return { parts, radius: R * 1.0 };
+      },
+
+      globular: (o) => {
+        const parts = [];
+        for (let i = 0; i < 160; i++) {
+          const r = Math.pow(Math.random(), 1.6) * o.size * 0.4;  // center-heavy
+          const a = Math.random() * Math.PI * 2;
+          const hue = (Math.random() < 0.6 ? o.hueA : o.hueB) + rand(-8, 8);
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r, hue,
+                            0.3 + Math.random() * 0.7,
+                            Math.random() < 0.06));
+        }
+        return { parts, radius: o.size * 0.5 };
+      },
+
+      helixEye: (o) => {
+        const parts = [];
+        const R = o.size * 0.45;
+        // outer red ring
+        for (let i = 0; i < 80; i++) {
+          const a = (i / 80) * Math.PI * 2 + rand(-0.03, 0.03);
+          const r = R + rand(-7, 7);
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r,
+                            o.hueB + rand(-8, 8),
+                            0.4 + Math.random() * 0.4, false));
+        }
+        // inner blue ring
+        for (let i = 0; i < 48; i++) {
+          const a = (i / 48) * Math.PI * 2 + rand(-0.05, 0.05);
+          const r = R * 0.5 + rand(-3, 3);
+          parts.push(mkStar(Math.cos(a) * r, Math.sin(a) * r,
+                            o.hueA + rand(-10, 10),
+                            0.5 + Math.random() * 0.4, false));
+        }
+        parts.push(mkStar(0, 0, 45, 1.0, true));  // central dwarf
+        return { parts, radius: R + 10 };
+      }
+    };
+
+    // ==================== Gesture ====================
+    function dist(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    function fingerStraightness(hand, mcp, pip, dip, tip) {
+      const seg = dist(hand[mcp], hand[pip]) + dist(hand[pip], hand[dip]) + dist(hand[dip], hand[tip]);
+      if (seg < 1e-4) return 0;
+      return dist(hand[mcp], hand[tip]) / seg;
+    }
+    function classifyGesture(hand) {
+      if (!hand || hand.length < 21) return { name: "unknown", bentCount: 0, extCount: 0 };
+      const idxS   = fingerStraightness(hand, 5, 6, 7, 8);
+      const midS   = fingerStraightness(hand, 9, 10, 11, 12);
+      const ringS  = fingerStraightness(hand, 13, 14, 15, 16);
+      const pinkyS = fingerStraightness(hand, 17, 18, 19, 20);
+      const bentCount = (idxS < 0.88) + (midS < 0.88) + (ringS < 0.88) + (pinkyS < 0.88);
+      const extCount  = (idxS > 0.92) + (midS > 0.92) + (ringS > 0.92) + (pinkyS > 0.92);
+      let name = "other";
+      if (bentCount === 4) name = "fist";
+      else if (extCount === 4) name = "open";
+      return { name, bentCount, extCount };
+    }
+
+    // ==================== Camera ====================
+    async function startCamera() {
+      log("requesting camera...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      const video = document.getElementById("webcam");
+      video.srcObject = stream;
+      await new Promise(res => video.onloadedmetadata = res);
+      await video.play();
+      log("camera " + video.videoWidth + "x" + video.videoHeight);
+      state.video = video;
+      return video;
+    }
+
+    // ==================== MediaPipe ====================
+    async function startMediaPipe(video) {
+      log("loading MediaPipe...");
+      const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const { HandLandmarker, FilesetResolver } = mod;
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      state.mpReady = true;
+      log("MediaPipe READY");
+
+      let lastTs = -1;
+      function detect() {
+        if (video.currentTime !== lastTs) {
+          lastTs = video.currentTime;
+          const hr = handLandmarker.detectForVideo(video, performance.now());
+          state.hands = hr.landmarks || [];
+          state.handInfos = state.hands.map(classifyGesture);
+        }
+        requestAnimationFrame(detect);
+      }
+      detect();
+    }
+
+    // ==================== p5 sketch ====================
+    function startSketch() {
+      log("creating p5 sketch...");
+      new p5((p) => {
+
+        // fist→open spawn state
+        const FIST_HOLD_FRAMES = 18;
+        const OPEN_CONFIRM     = 3;
+        const SPAWN_COOLDOWN   = 36;
+        const fistHoldTime  = [0, 0];
+        const openStreak    = [0, 0];
+        const spawnCooldown = [0, 0];
+
+        // background starfield
+        const BG_STARS = 240;
+        const bgStars = [];
+
+        const NEBULA_CAP = 20;
+
+        p.setup = function () {
+          p.createCanvas(window.innerWidth, window.innerHeight);
+          p.pixelDensity(1);
+          initBgStars();
+          log("p5 setup " + window.innerWidth + "x" + window.innerHeight);
+        };
+        p.windowResized = function () {
+          p.resizeCanvas(window.innerWidth, window.innerHeight);
+          initBgStars();
+        };
+
+        function initBgStars() {
+          bgStars.length = 0;
+          for (let i = 0; i < BG_STARS; i++) {
+            bgStars.push({
+              x: Math.random() * p.width,
+              y: Math.random() * p.height,
+              size: 0.4 + Math.random() * 1.3,
+              brightness: 0.2 + Math.random() * 0.55,
+              phase: Math.random() * Math.PI * 2,
+              freq: 0.0008 + Math.random() * 0.002
+            });
+          }
+        }
+
+        function spawnNebula(cx, cy) {
+          let idx = Math.floor(Math.random() * REAL_OBJECTS.length);
+          if (idx === state.lastSpawnedIndex && REAL_OBJECTS.length > 1) {
+            idx = (idx + 1) % REAL_OBJECTS.length;
+          }
+          state.lastSpawnedIndex = idx;
+          const o = REAL_OBJECTS[idx];
+          const gen = genFor[o.type];
+          const { parts, radius } = gen(o);
+
+          // Formation animation: each particle's generator-given (x,y) is its FINAL
+          // position. We scatter it across the screen first, then converge.
+          for (const pt of parts) {
+            pt.targetX = pt.x;
+            pt.targetY = pt.y;
+            const worldX = Math.random() * p.width;
+            const worldY = Math.random() * p.height;
+            pt.scatterX = worldX - cx;
+            pt.scatterY = worldY - cy;
+          }
+
+          const rotationRate = (Math.random() - 0.5) * 0.00018;
+          state.nebulas.push({
+            name: o.name,
+            cx, cy,
+            hueA: o.hueA, hueB: o.hueB,
+            parts, radius,
+            rotationRate,
+            bornAt: performance.now()
+          });
+          while (state.nebulas.length > NEBULA_CAP) state.nebulas.shift();
+          log("born: " + o.name);
+        }
+
+        // ===== draw =====
+        p.draw = function () {
+          p.background(4, 5, 15);
+
+          if (state.camOn && state.video && state.video.videoWidth > 0) {
+            const v = state.video;
+            const vw = p.width;
+            const vh = p.width * (v.videoHeight / v.videoWidth);
+            const vy = (p.height - vh) / 2;
+            p.push();
+            p.drawingContext.save();
+            p.drawingContext.globalAlpha = 0.18;
+            p.drawingContext.translate(p.width, 0);
+            p.drawingContext.scale(-1, 1);
+            p.drawingContext.drawImage(v, 0, vy, vw, vh);
+            p.drawingContext.restore();
+            p.pop();
+          }
+
+          drawBgStars();
+          drawNebulas();
+
+          const hands = state.hands || [];
+          const infos = state.handInfos || [];
+          for (let hi = 0; hi < hands.length; hi++) {
+            const hand = hands[hi];
+            if (!hand || hand.length < 21) {
+              fistHoldTime[hi] = 0;
+              openStreak[hi]   = 0;
+              continue;
+            }
+            const info = infos[hi];
+            const rawName = info?.name || "unknown";
+            if (spawnCooldown[hi] > 0) spawnCooldown[hi]--;
+
+            if (rawName === "fist") {
+              fistHoldTime[hi]++;
+              openStreak[hi] = 0;
+            } else if (rawName === "open") {
+              openStreak[hi]++;
+            } else {
+              openStreak[hi] = 0;
+              fistHoldTime[hi] = Math.max(0, fistHoldTime[hi] - 3);
+            }
+
+            if (fistHoldTime[hi] >= FIST_HOLD_FRAMES
+                && openStreak[hi] >= OPEN_CONFIRM
+                && spawnCooldown[hi] === 0) {
+              const palm = hand[9];
+              spawnNebula((1 - palm.x) * p.width, palm.y * p.height);
+              spawnCooldown[hi] = SPAWN_COOLDOWN;
+              fistHoldTime[hi]  = 0;
+              openStreak[hi]    = 0;
+            }
+
+            drawPalmIndicator(hand, hi);
+            drawFingertips(hand);
+          }
+
+          drawFooter();
+        };
+
+        // ===== renderers =====
+        function drawBgStars() {
+          const ctx = p.drawingContext;
+          const t = p.millis();
+          for (const s of bgStars) {
+            // gentler amplitude — no sparkle
+            const tw = 0.7 + Math.sin(t * s.freq + s.phase) * 0.3;
+            const a  = s.brightness * tw;
+            ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+            ctx.fillRect(s.x, s.y, s.size, s.size);
+          }
+        }
+
+        const FORMATION_MS = 2000;   // total formation duration
+        const SCATTER_PEAK = 350;    // ms until particles fully scattered
+
+        function easeOutQuad(t) { return 1 - (1 - t) * (1 - t); }
+        function easeInOutCubic(t) {
+          return t < 0.5
+            ? 4 * t * t * t
+            : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        function drawNebulas() {
+          const ctx = p.drawingContext;
+          const now = performance.now();
+
+          for (const neb of state.nebulas) {
+            const age  = now - neb.bornAt;
+
+            // Haze fades in only in the second half of formation (as particles converge)
+            const hazeFade = Math.max(0, Math.min(1, (age - FORMATION_MS * 0.5) / (FORMATION_MS * 0.5 + 400)));
+            if (hazeFade > 0.02) {
+              const haze = ctx.createRadialGradient(neb.cx, neb.cy, 0, neb.cx, neb.cy, neb.radius * 1.2);
+              haze.addColorStop(0,    `hsla(${neb.hueA}, 90%, 55%, ${(0.26 * hazeFade).toFixed(3)})`);
+              haze.addColorStop(0.35, `hsla(${neb.hueB}, 85%, 55%, ${(0.15 * hazeFade).toFixed(3)})`);
+              haze.addColorStop(0.75, `hsla(${neb.hueB}, 80%, 40%, ${(0.05 * hazeFade).toFixed(3)})`);
+              haze.addColorStop(1,    `hsla(${neb.hueB}, 80%, 55%, 0)`);
+              ctx.fillStyle = haze;
+              ctx.beginPath();
+              ctx.arc(neb.cx, neb.cy, neb.radius * 1.2, 0, Math.PI * 2);
+              ctx.fill();
+            }
+
+            // Rotation only after formation (subtle)
+            const postFormAge = Math.max(0, age - FORMATION_MS);
+            const rot  = postFormAge * neb.rotationRate;
+            const cosR = Math.cos(rot), sinR = Math.sin(rot);
+
+            for (const pt of neb.parts) {
+              // ===== Formation position: origin → scatter → target =====
+              let px, py;
+              if (age < SCATTER_PEAK) {
+                // Phase 1 — explode from palm (origin) toward scatter point
+                const t = age / SCATTER_PEAK;
+                const e = easeOutQuad(t);
+                px = pt.scatterX * e;
+                py = pt.scatterY * e;
+              } else if (age < FORMATION_MS) {
+                // Phase 2 — converge from scatter to rotated target
+                const t = (age - SCATTER_PEAK) / (FORMATION_MS - SCATTER_PEAK);
+                const e = easeInOutCubic(t);
+                const tx = pt.targetX * cosR - pt.targetY * sinR;
+                const ty = pt.targetX * sinR + pt.targetY * cosR;
+                px = pt.scatterX + (tx - pt.scatterX) * e;
+                py = pt.scatterY + (ty - pt.scatterY) * e;
+              } else {
+                // Formed — just target with slow rotation
+                px = pt.targetX * cosR - pt.targetY * sinR;
+                py = pt.targetX * sinR + pt.targetY * cosR;
+              }
+
+              // Fade-in as particle leaves the palm: 0→1 over first 200ms
+              const appear = Math.min(1, age / 200);
+              // Very gentle breathing (no sparkle)
+              const breath = 0.92 + Math.sin(now * 0.0008 + pt.phase) * 0.08;
+              const alpha = Math.min(1, pt.brightness * breath * appear);
+
+              ctx.shadowColor = `hsl(${pt.hue}, 95%, 72%)`;
+              ctx.shadowBlur  = 5;
+              ctx.fillStyle   = `hsla(${pt.hue}, 95%, 78%, ${alpha.toFixed(2)})`;
+              ctx.beginPath();
+              ctx.arc(neb.cx + px, neb.cy + py, pt.size, 0, Math.PI * 2);
+              ctx.fill();
+            }
+            ctx.shadowBlur = 0;
+
+            // Name label — appears only after formation
+            if (age > FORMATION_MS) {
+              const labelAlpha = Math.min(0.9, (age - FORMATION_MS) / 600);
+              p.noStroke();
+              p.fill(240, 240, 255, labelAlpha * 180);
+              p.textFont("Courier New");
+              p.textSize(9);
+              p.textAlign(p.CENTER, p.TOP);
+              p.text(neb.name, neb.cx, neb.cy + neb.radius + 10);
+            }
+          }
+        }
+
+        function drawPalmIndicator(hand, hi) {
+          if (!hand || !hand[9]) return;
+          const cx = (1 - hand[9].x) * p.width;
+          const cy = hand[9].y * p.height;
+          const ctx = p.drawingContext;
+
+          const progress = Math.min(1, fistHoldTime[hi] / FIST_HOLD_FRAMES);
+          if (progress > 0.05) {
+            const ready = progress >= 1;
+            const R = 40;
+            ctx.strokeStyle = ready ? "rgba(255,220,255,0.95)" : "rgba(200,180,255,0.65)";
+            ctx.lineWidth = ready ? 3 : 2;
+            ctx.shadowColor = ready ? "rgba(255,200,255,0.9)" : "rgba(180,150,255,0.5)";
+            ctx.shadowBlur = ready ? 16 : 6;
+            ctx.beginPath();
+            ctx.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            if (ready) {
+              p.noStroke();
+              p.fill(255, 220, 255);
+              p.textFont("Courier New");
+              p.textSize(10);
+              p.textAlign(p.CENTER, p.TOP);
+              p.text("OPEN HAND → BIRTH", cx, cy + R + 8);
+            }
+          }
+
+          ctx.shadowColor = "rgba(200,180,255,0.9)";
+          ctx.shadowBlur = 14;
+          ctx.fillStyle = "rgba(220,200,255,0.95)";
+          ctx.beginPath();
+          ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.fillStyle = "#fff";
+          ctx.beginPath();
+          ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        function drawFingertips(hand) {
+          const ctx = p.drawingContext;
+          ctx.fillStyle = "rgba(255,255,255,0.35)";
+          for (const t of [4, 8, 12, 16, 20]) {
+            const lm = hand[t];
+            if (!lm) continue;
+            const x = (1 - lm.x) * p.width;
+            const y = lm.y * p.height;
+            ctx.beginPath();
+            ctx.arc(x, y, 1.8, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        function drawFooter() {
+          p.noStroke();
+          p.fill(220, 180);
+          p.textFont("Courier New");
+          p.textSize(10);
+          p.textAlign(p.CENTER, p.BOTTOM);
+          const count    = state.nebulas.length;
+          const charging = fistHoldTime.some(t => t > 2 && t < FIST_HOLD_FRAMES);
+          const ready    = fistHoldTime.some(t => t >= FIST_HOLD_FRAMES);
+          const status   = ready    ? " · READY → OPEN HAND"
+                         : charging ? " · CHARGING…"
+                         : "";
+          p.text(`${count} / 20 DEEP-SKY OBJECTS${status}`, p.width / 2, p.height - 52);
+        }
+      });
+    }
+
+    // ==================== UI toggles ====================
+    const camBtn = document.getElementById("camBtn");
+    camBtn.addEventListener("click", () => {
+      state.camOn = !state.camOn;
+      camBtn.innerText = state.camOn ? "◉ CAM ON" : "◐ CAM OFF";
+      camBtn.classList.toggle("active", state.camOn);
+    });
+    const clearBtn = document.getElementById("clearBtn");
+    clearBtn.addEventListener("click", () => {
+      state.nebulas = [];
+      log("cosmos cleared");
+    });
+
+    // ==================== Recording ====================
+    const recBtn = document.getElementById("recBtn");
+    const recFmt = document.getElementById("recFmt");
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recMime = "", recExt = "";
+
+    function pickMime() {
+      const candidates = [
+        ["video/mp4;codecs=avc1.42E01E", "mp4"],
+        ["video/mp4;codecs=h264",         "mp4"],
+        ["video/mp4",                     "mp4"],
+        ["video/webm;codecs=vp9",         "webm"],
+        ["video/webm;codecs=vp8",         "webm"],
+        ["video/webm",                    "webm"]
+      ];
+      for (const [m, e] of candidates) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+          return { mime: m, ext: e };
+        }
+      }
+      return { mime: "", ext: "webm" };
+    }
+    function startRec() {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return;
+      const { mime, ext } = pickMime();
+      recMime = mime; recExt = ext;
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (e) {
+        log("rec err: " + e.message);
+        mediaRecorder = new MediaRecorder(stream);
+        recExt = "webm";
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recMime || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `nebulas-${Date.now()}.${recExt}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      };
+      mediaRecorder.start();
+      recBtn.classList.add("recording");
+      recBtn.innerText = "■ STOP";
+      recFmt.innerText = recExt.toUpperCase();
+      log("recording " + (recExt || "webm"));
+    }
+    function stopRec() {
+      if (!mediaRecorder) return;
+      mediaRecorder.stop();
+      mediaRecorder = null;
+      recBtn.classList.remove("recording");
+      recBtn.innerText = "● RECORD";
+    }
+    recBtn.addEventListener("click", () => {
+      if (mediaRecorder) stopRec(); else startRec();
+    });
+
+    async function boot() {
+      btn.style.display = "none";
+      try {
+        await startCamera();
+        startSketch();
+        requestAnimationFrame(() => {
+          recBtn.style.display   = "block";
+          camBtn.style.display   = "block";
+          clearBtn.style.display = "block";
+          const { ext } = pickMime();
+          recFmt.innerText = ext.toUpperCase() + " READY";
+        });
+        await startMediaPipe(state.video);
+      } catch (err) {
+        log("ERROR: " + (err.name || "") + " " + err.message);
+        btn.style.display = "block";
+        btn.innerText = "⚠ RETRY";
+      }
+    }
+
+    btn.addEventListener("click", boot);
+    log("click START to begin");
+  </script>
+</body>
+</html>

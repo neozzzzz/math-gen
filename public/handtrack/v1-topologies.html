@@ -1,0 +1,1419 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Topologies of Thoughts — Hand Tracking</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    color: #fff;
+  }
+  #webcam {
+    position: fixed; top: 0; left: 0;
+    width: 1px; height: 1px; opacity: 0; pointer-events: none;
+  }
+  canvas { display: block; }
+  #title {
+    position: fixed; top: 16px; right: 16px;
+    font-size: 13px; color: #aaa; letter-spacing: 0.15em;
+    text-align: right; pointer-events: none; z-index: 10;
+  }
+  #hint {
+    position: fixed; bottom: 16px; right: 16px;
+    font-size: 10px; color: #555; letter-spacing: 0.1em;
+    pointer-events: none; z-index: 10;
+  }
+  #debugLog {
+    position: fixed; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #0f0;
+    padding: 6px 10px; border: 1px solid #333;
+    font-size: 10px; font-family: monospace;
+    white-space: pre; z-index: 200; max-width: 320px;
+    line-height: 1.5;
+  }
+  #startBtn {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: #fff; color: #000; border: none;
+    padding: 20px 40px; font-size: 16px; font-family: monospace;
+    letter-spacing: 0.2em; cursor: pointer; z-index: 150;
+  }
+  #recBtn, #faceBtn, #camBtn {
+    position: fixed; bottom: 16px;
+    background: transparent; color: #fff;
+    border: 1px solid #555;
+    padding: 8px 18px; font-size: 11px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 20;
+    transition: all 0.2s;
+  }
+  /* Arrangement: [FACE] [CAM] [REC] centered */
+  #camBtn  { left: 50%; transform: translateX(-50%); }
+  #recBtn  { left: 50%; transform: translateX(calc(50% + 10px)); }
+  #faceBtn { left: 50%; transform: translateX(calc(-150% - 10px)); }
+  #recBtn.recording {
+    background: #c22; border-color: #f44; color: #fff;
+  }
+  #faceBtn.active, #camBtn.active {
+    background: #252; border-color: #5e5;
+  }
+  #recBtn:hover, #faceBtn:hover, #camBtn:hover { border-color: #aaa; }
+  #faceBtn:disabled { opacity: 0.5; cursor: wait; }
+</style>
+</head>
+<body>
+  <a href="index.html" id="menuLink" style="position:fixed;top:14px;left:14px;z-index:250;font:10px 'Courier New',monospace;letter-spacing:0.2em;color:#888;text-decoration:none;border:1px solid #333;padding:6px 10px;background:rgba(0,0,0,0.4);">← MENU</a>
+  <video id="webcam" autoplay playsinline muted></video>
+  <div id="title">TOPOLOGIES<br/>OF THOUGHTS</div>
+  <div id="hint">PINCH · FIST · PEACE · OPEN</div>
+  <div id="debugLog">booting...</div>
+  <button id="startBtn">▶ START (CLICK TO ENABLE CAMERA)</button>
+  <button id="faceBtn" style="display:none">🙂 FACE OFF</button>
+  <button id="camBtn" style="display:none">◉ CAM ON</button>
+  <button id="recBtn" style="display:none">● RECORD</button>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+
+  <script type="module">
+    const dbg = document.getElementById("debugLog");
+    const btn = document.getElementById("startBtn");
+    const recBtn = document.getElementById("recBtn");
+    const logs = [];
+    function log(msg) {
+      logs.push(msg);
+      if (logs.length > 10) logs.shift();
+      dbg.innerText = logs.join("\n");
+      console.log("[boot]", msg);
+    }
+    window.addEventListener("error", (e) => log("ERR: " + e.message));
+    window.addEventListener("unhandledrejection", (e) => log("PROMISE ERR: " + (e.reason?.message || e.reason)));
+
+    const state = {
+      video: null,
+      hands: [],
+      mpReady: false,
+      handInfos: [],
+      face: null,
+      faceBlendshapes: null,
+      faceEvents: {},
+      faceOn: false,           // user-toggled face tracking
+      faceLandmarker: null,    // lazy-created on first enable
+      mpModule: null,          // MediaPipe Tasks Vision module (for lazy face load)
+      mpVision: null,          // FilesetResolver vision instance (shared)
+      events: [],
+    };
+
+    function processFaceBlendshapes(bs) {
+      const s = {};
+      if (bs && bs.categories) {
+        for (const c of bs.categories) s[c.categoryName] = c.score;
+      }
+      return {
+        blinkL:     s.eyeBlinkLeft        || 0,
+        blinkR:     s.eyeBlinkRight       || 0,
+        bothBlink: (s.eyeBlinkLeft || 0)  > 0.5 && (s.eyeBlinkRight || 0) > 0.5,
+        mouthOpen:  s.jawOpen             || 0,
+        smile:      Math.max(s.mouthSmileLeft || 0, s.mouthSmileRight || 0),
+        pucker:     s.mouthPucker         || 0,
+        browUp:     Math.max(s.browOuterUpLeft || 0, s.browOuterUpRight || 0, s.browInnerUp || 0),
+        browDown:   Math.max(s.browDownLeft || 0, s.browDownRight || 0),
+      };
+    }
+
+    // ===== Audio (Web Audio API) =====
+    let audioCtx = null;
+    function initAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+    }
+    function playTone(freq, dur = 0.15, type = "sine", volume = 0.08) {
+      if (!audioCtx) return;
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      osc.connect(g); g.connect(audioCtx.destination);
+      g.gain.setValueAtTime(0, audioCtx.currentTime);
+      g.gain.linearRampToValueAtTime(volume, audioCtx.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+      osc.start();
+      osc.stop(audioCtx.currentTime + dur + 0.02);
+    }
+    function playPinch()    { playTone(880, 0.08, "triangle", 0.1); }
+    function playModeChange(mode) {
+      const chords = [
+        [262, 392, 523],   // C major
+        [294, 370, 440],   // D minor
+        [330, 415, 494]    // E dim-ish
+      ];
+      const c = chords[mode % 3];
+      c.forEach((f, i) => setTimeout(() => playTone(f, 0.4, "sine", 0.06), i * 60));
+    }
+    window.__audio = { playPinch, playModeChange };
+
+    // ===== Recording (MP4 preferred, webm fallback) =====
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recMime = "", recExt = "";
+    function pickMime() {
+      const candidates = [
+        ["video/mp4;codecs=avc1.42E01E", "mp4"],
+        ["video/mp4;codecs=h264",         "mp4"],
+        ["video/mp4",                     "mp4"],
+        ["video/webm;codecs=vp9",         "webm"],
+        ["video/webm;codecs=vp8",         "webm"],
+        ["video/webm",                    "webm"]
+      ];
+      for (const [m, e] of candidates) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+          return { mime: m, ext: e };
+        }
+      }
+      return { mime: "", ext: "webm" };
+    }
+    function startRec() {
+      if (!state.video) return;
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return;
+      const { mime, ext } = pickMime();
+      recMime = mime; recExt = ext;
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch {
+        mediaRecorder = new MediaRecorder(stream);
+        recExt = "webm";
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recMime || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `topologies-${Date.now()}.${recExt}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      };
+      mediaRecorder.start();
+      recBtn.classList.add("recording");
+      recBtn.innerText = "■ STOP";
+      log("recording " + recExt);
+    }
+    function stopRec() {
+      if (!mediaRecorder) return;
+      mediaRecorder.stop();
+      mediaRecorder = null;
+      recBtn.classList.remove("recording");
+      recBtn.innerText = "● RECORD";
+      log("recording saved");
+    }
+    recBtn.addEventListener("click", () => {
+      if (mediaRecorder) stopRec(); else startRec();
+    });
+
+    // ===== Camera =====
+    async function startCamera() {
+      log("requesting camera...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      const video = document.getElementById("webcam");
+      video.srcObject = stream;
+      await new Promise(res => video.onloadedmetadata = res);
+      await video.play();
+      log("camera " + video.videoWidth + "x" + video.videoHeight);
+      state.video = video;
+      return video;
+    }
+
+    // ===== MediaPipe =====
+    async function startMediaPipe(video) {
+      log("loading MediaPipe...");
+      const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const { HandLandmarker, FilesetResolver } = mod;
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      log("hand landmarker ready");
+
+      // stash for later lazy face load
+      state.mpModule = mod;
+      state.mpVision = vision;
+      state.mpReady = true;
+      log("MediaPipe READY (face OFF)");
+
+      let lastTs = -1;
+      let faceFrame = 0;
+      function detect() {
+        if (video.currentTime !== lastTs) {
+          lastTs = video.currentTime;
+          const ts = performance.now();
+          // hands every frame
+          const hr = handLandmarker.detectForVideo(video, ts);
+          state.hands = hr.landmarks || [];
+          state.handInfos = state.hands.map(classifyGesture);
+          // face: only when toggle enabled + landmarker loaded, every 2nd frame
+          if (state.faceOn && state.faceLandmarker && ((faceFrame++ & 1) === 0)) {
+            const fr = state.faceLandmarker.detectForVideo(video, ts);
+            state.face = (fr.faceLandmarks && fr.faceLandmarks[0]) || null;
+            state.faceBlendshapes = (fr.faceBlendshapes && fr.faceBlendshapes[0]) || null;
+            state.faceEvents = processFaceBlendshapes(state.faceBlendshapes);
+          }
+        }
+        requestAnimationFrame(detect);
+      }
+      detect();
+    }
+
+    // Lazy-load + toggle the face landmarker
+    const faceBtn = document.getElementById("faceBtn");
+    async function toggleFace() {
+      if (state.faceOn) {
+        state.faceOn = false;
+        state.face = null;
+        state.faceBlendshapes = null;
+        state.faceEvents = {};
+        faceBtn.innerText = "🙂 FACE OFF";
+        faceBtn.classList.remove("active");
+        log("face: OFF");
+        return;
+      }
+      // enabling
+      faceBtn.disabled = true;
+      faceBtn.innerText = "🙂 LOADING...";
+      try {
+        if (!state.faceLandmarker) {
+          if (!state.mpModule || !state.mpVision) throw new Error("MediaPipe not ready yet");
+          const { FaceLandmarker } = state.mpModule;
+          state.faceLandmarker = await FaceLandmarker.createFromOptions(state.mpVision, {
+            baseOptions: {
+              modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+              delegate: "GPU"
+            },
+            runningMode: "VIDEO",
+            numFaces: 1,
+            outputFaceBlendshapes: true,
+            outputFacialTransformationMatrixes: false
+          });
+          log("face landmarker loaded");
+        }
+        state.faceOn = true;
+        faceBtn.innerText = "🙂 FACE ON";
+        faceBtn.classList.add("active");
+        log("face: ON");
+      } catch (e) {
+        log("face load err: " + e.message);
+        faceBtn.innerText = "🙂 FACE OFF";
+      } finally {
+        faceBtn.disabled = false;
+      }
+    }
+    faceBtn.addEventListener("click", toggleFace);
+
+    // ===== Camera visibility toggle (default ON for v1) =====
+    const camBtn = document.getElementById("camBtn");
+    state.camOn = true;
+    camBtn.classList.add("active");
+    camBtn.addEventListener("click", () => {
+      state.camOn = !state.camOn;
+      camBtn.innerText = state.camOn ? "◉ CAM ON" : "◐ CAM OFF";
+      camBtn.classList.toggle("active", state.camOn);
+    });
+
+    // ===== Gesture classification =====
+    // Returns { name, ext: { thumb,index,middle,ring,pinky } }
+    function classifyGesture(hand) {
+      if (!hand || hand.length < 21) return { name: "unknown", ext: {} };
+      const wrist = hand[0];
+      function d(a, b) {
+        const dx = a.x - b.x, dy = a.y - b.y;
+        return Math.sqrt(dx*dx + dy*dy);
+      }
+      const ext = {
+        thumb:  d(hand[4],  wrist) > d(hand[2],  wrist) * 1.1,
+        index:  d(hand[8],  wrist) > d(hand[6],  wrist) * 1.15,
+        middle: d(hand[12], wrist) > d(hand[10], wrist) * 1.15,
+        ring:   d(hand[16], wrist) > d(hand[14], wrist) * 1.1,
+        pinky:  d(hand[20], wrist) > d(hand[18], wrist) * 1.1,
+      };
+      const pinchDist = d(hand[4], hand[8]);
+      const extCount = +ext.thumb + +ext.index + +ext.middle + +ext.ring + +ext.pinky;
+
+      let name = "unknown";
+      if (pinchDist < 0.05 && ext.middle) name = "pinch";
+      // rock 🤘 : thumb + index + pinky (classic rock horns)
+      else if (ext.thumb && ext.index && !ext.middle && !ext.ring && ext.pinky) name = "rock";
+      // shaka 🤙 : thumb + pinky only
+      else if (ext.thumb && !ext.index && !ext.middle && !ext.ring && ext.pinky) name = "shaka";
+      // three : index + middle + ring
+      else if (!ext.thumb && ext.index && ext.middle && ext.ring && !ext.pinky) name = "three";
+      // four : all but thumb
+      else if (!ext.thumb && ext.index && ext.middle && ext.ring && ext.pinky) name = "four";
+      // thumbs up : thumb only
+      else if (ext.thumb && !ext.index && !ext.middle && !ext.ring && !ext.pinky) name = "thumbsup";
+      // peace ✌️
+      else if (ext.index && ext.middle && !ext.ring && !ext.pinky) name = "peace";
+      // fist ✊
+      else if (extCount === 0) name = "fist";
+      // open 🖐 (all 5 or index+middle+ring+pinky)
+      else if (ext.index && ext.middle && ext.ring && ext.pinky) name = "open";
+      // point 👆
+      else if (ext.index && !ext.middle && !ext.ring && !ext.pinky) name = "point";
+      return { name, ext };
+    }
+
+    // ===== p5 sketch =====
+    function startSketch() {
+      log("creating p5 sketch...");
+      new p5((p) => {
+
+        // ---- mode + graph state ----
+        let mode = 0;
+        const MODE_NAMES = ["centralized", "decentralized", "distributed"];
+        const MODE_DESC = [
+          "one core idea connecting all others",
+          "notes in different clusters by topic",
+          "edges labeled by llm describing relations"
+        ];
+        const SIDE_NOTES = [
+          ["interface that taps", "into these", "ancestral instincts"],
+          ["the evolution of", "notation in arts", "and sciences"],
+          ["ways to spark", "new ideas"],
+          ["shows traces of", "possible paths"],
+          ["beyond the surface", "latent geometries", "manifold"],
+          ["self-organization,", "morphogenesis,", "biophysics,", "pattern formation"],
+          ["claude.soti", "document"],
+          ["nodal-points-digest-", "week-0201-draft"],
+          ["five elemental", "types of work"],
+          ["accessibility space,", "analysis"],
+          ["a grounded and", "manifold range"],
+          ["machines", "and emotions"],
+          ["reading an article", "like landscape"]
+        ];
+        const BRACKET_NOTES = [
+          "[Artificial Life & Morphogenesis]",
+          "[Generative Media & Notation]",
+          "[Cognition, Language & AI]",
+          "[History of Information Tools]",
+          "[Interface Design & Aesthetics]",
+          "[Emergence & Self-Organization]",
+          "[Pattern Formation]",
+          "[Clusters of Information Tools]",
+          "[Inspiration, Language & AI]",
+          "[Latent Spaces]"
+        ];
+
+        let dots = [];          // 1px particles
+        let noiseParticles = [];
+        let burstParticles = [];
+        let activeNotes = [];   // displayed side-text labels
+
+        let NUM_DOTS = 350;                     // will auto-adjust based on fps
+        const FINGER_TIPS = [4, 8, 12, 16, 20]; // thumb, index, middle, ring, pinky
+        let autoAdjustDone = false;
+
+        // pinch / gesture state per hand
+        let pinchState = [false, false];
+        let pinchCool  = [0, 0];
+        let lastGesture = ["unknown", "unknown"];
+        let modeChangeTime = 0;
+
+        // face event state
+        let lastBothBlink = false;
+        let blinkCool = 0;
+        let lastMouthOpen = false;
+        let lastPucker = false;
+
+        // separate graphics layer for graph (for trails)
+        let graphLayer = null;
+
+        function regen() {
+          activeNotes = [];
+          const regularPool = [...SIDE_NOTES].sort(() => Math.random() - 0.5);
+          const bracketPool = [...BRACKET_NOTES].sort(() => Math.random() - 0.5);
+          const nNotes = 6 + p.floor(p.random(0, 3));   // 6–8
+          for (let i = 0; i < nNotes; i++) {
+            // every ~3rd slot = bracket category (cyan)
+            const useBracket = i % 3 === 0 && bracketPool.length > 0;
+            const text = useBracket
+              ? [bracketPool.shift()]
+              : regularPool[i % regularPool.length];
+            const side = Math.random() < 0.5 ? "left" : "right";
+            const x = side === "left"
+              ? p.random(90, 260)
+              : p.random(p.width - 300, p.width - 90);
+            const y = p.random(150, p.height - 180);
+            activeNotes.push({
+              text, x, y, side,
+              bornAt: p.millis(),
+              isBracket: useBracket
+            });
+          }
+        }
+
+        function initDots() {
+          dots = [];
+          for (let i = 0; i < NUM_DOTS; i++) {
+            dots.push({
+              x: Math.random() * window.innerWidth,
+              y: Math.random() * window.innerHeight,
+              vx: 0, vy: 0,
+              group: i % 5,       // for mode 1 — pins dot to one of 5 fingers
+              phase: Math.random() * Math.PI * 2
+            });
+          }
+        }
+
+        // Collect fingertip attractors — ONLY for extended fingers.
+        // If no fingers extended (fist), use palm as single attractor.
+        const FINGER_KEYS = ["thumb", "index", "middle", "ring", "pinky"];
+        function collectTargets(hands, mode) {
+          const tips = [];
+          const palms = [];
+          const infos = state.handInfos || [];
+          for (let hi = 0; hi < hands.length; hi++) {
+            const h = hands[hi];
+            if (!h || h.length < 21) continue;
+            const ext = (infos[hi] && infos[hi].ext) || {
+              thumb:true, index:true, middle:true, ring:true, pinky:true
+            };
+            for (let f = 0; f < 5; f++) {
+              if (!ext[FINGER_KEYS[f]]) continue;
+              const idx = FINGER_TIPS[f];
+              tips.push({
+                x: (1 - h[idx].x) * p.width,
+                y: h[idx].y * p.height,
+                finger: f
+              });
+            }
+            palms.push({
+              x: (1 - h[0].x) * p.width,
+              y: h[0].y * p.height
+            });
+          }
+          return { tips, palms };
+        }
+
+        function updateDots(hands, mode) {
+          let { tips, palms } = collectTargets(hands, mode);
+          // if fist (no fingers extended) but hand detected → use palm as single tip
+          if (tips.length === 0 && palms.length > 0) {
+            tips = palms.map(p2 => ({ x: p2.x, y: p2.y, finger: -1 }));
+          }
+
+          // ---- face-driven continuous forces ----
+          const fe = state.faceEvents || {};
+          const face = state.face;
+          let faceX = p.width / 2, faceY = p.height / 2, hasFace = false;
+          let leftEye = null, rightEye = null;
+          if (face && face[1]) {
+            faceX = (1 - face[1].x) * p.width;
+            faceY = face[1].y * p.height;
+            hasFace = true;
+            // iris landmarks (available when face_landmarker has iris enabled)
+            const lePt = face[468] || face[33];
+            const rePt = face[473] || face[263];
+            if (lePt) leftEye  = { x: (1 - lePt.x) * p.width, y: lePt.y * p.height };
+            if (rePt) rightEye = { x: (1 - rePt.x) * p.width, y: rePt.y * p.height };
+          }
+
+          // If no hand targets → face becomes primary attractor (nose + both eyes)
+          if (tips.length === 0 && hasFace) {
+            tips = [{ x: faceX, y: faceY, finger: -1 }];
+            if (leftEye)  tips.push({ x: leftEye.x,  y: leftEye.y,  finger: -2 });
+            if (rightEye) tips.push({ x: rightEye.x, y: rightEye.y, finger: -3 });
+          }
+          const hasHand = tips.length > 0;
+
+          // Wink detection (one eye closed, other open) → override target to that eye
+          const winkL = (fe.blinkL || 0) > 0.55 && (fe.blinkR || 0) < 0.35;
+          const winkR = (fe.blinkR || 0) > 0.55 && (fe.blinkL || 0) < 0.35;
+          let eyeOverride = null;
+          if (winkL && leftEye)       eyeOverride = leftEye;
+          else if (winkR && rightEye) eyeOverride = rightEye;
+
+          const browMod = (fe.browUp || 0) - (fe.browDown || 0);     // -1..+1
+          const puckerF = fe.pucker || 0;                            //  0..1
+          const mouthF  = fe.mouthOpen || 0;                         //  0..1
+
+          // Breathing cycle (~4s period): 0..1 oscillation
+          const now = p.millis();
+          const breathe = (Math.sin(now * 0.0015) + 1) / 2;  // 0..1
+          // gather phase = breathe high; spread phase = breathe low
+          const gather = Math.pow(breathe, 1.5);
+
+          // Attraction + drift strengths
+          const attract = p.lerp(0.02, 0.22, gather);
+          const drift = p.lerp(1.2, 0.2, gather);
+          const damp = 0.86 + 0.06 * gather;
+
+          for (const d of dots) {
+            let tx, ty;
+
+            // ==== WINK OVERRIDE: all dots rush to winking eye ====
+            if (eyeOverride) {
+              tx = eyeOverride.x;
+              ty = eyeOverride.y;
+              // strong pull — bypass normal attract value
+              const dx = tx - d.x, dy = ty - d.y;
+              const dist = Math.sqrt(dx * dx + dy * dy) + 1;
+              d.vx += (dx / dist) * 0.8;  // much stronger than normal attract (0.02..0.22)
+              d.vy += (dy / dist) * 0.8;
+              // minimal drift during wink
+              d.vx *= 0.85;
+              d.vy *= 0.85;
+              d.x += d.vx;
+              d.y += d.vy;
+              if (d.x < -20) d.x = p.width + 20;
+              if (d.x > p.width + 20) d.x = -20;
+              if (d.y < -20) d.y = p.height + 20;
+              if (d.y > p.height + 20) d.y = -20;
+              continue;
+            }
+
+            if (!hasHand) {
+              // fallback: gently orbit screen center
+              const cx = p.width / 2, cy = p.height / 2;
+              const ang = now * 0.0003 + d.phase;
+              tx = cx + Math.cos(ang) * 200;
+              ty = cy + Math.sin(ang) * 160;
+            } else if (mode === 0) {
+              // Centralized — all dots drawn to first palm (or first tip fallback)
+              const t = palms[0] || tips[0];
+              tx = t.x; ty = t.y;
+            } else if (mode === 1) {
+              // Decentralized — each dot locked to one fingertip (group)
+              const t = tips[d.group % tips.length];
+              tx = t.x; ty = t.y;
+            } else {
+              // Distributed — each dot picks nearest fingertip
+              let best = tips[0], bestD = 1e9;
+              for (const t of tips) {
+                const dx = t.x - d.x, dy = t.y - d.y;
+                const ds = dx * dx + dy * dy;
+                if (ds < bestD) { bestD = ds; best = t; }
+              }
+              tx = best.x; ty = best.y;
+            }
+
+            // attraction force
+            const dx = tx - d.x, dy = ty - d.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) + 1;
+            d.vx += (dx / dist) * attract;
+            d.vy += (dy / dist) * attract;
+
+            // random drift (stronger during spread phase)
+            d.vx += (Math.random() - 0.5) * drift;
+            d.vy += (Math.random() - 0.5) * drift;
+
+            // ---- face-driven forces ----
+            if (hasFace) {
+              // eyebrow: up = lift (neg y), down = sink (pos y)
+              d.vy -= browMod * 0.25;
+
+              // pucker: pull to face (nose tip)
+              if (puckerF > 0.25) {
+                const fdx = faceX - d.x, fdy = faceY - d.y;
+                const fdist = Math.sqrt(fdx * fdx + fdy * fdy) + 1;
+                const pf = puckerF * 0.6;
+                d.vx += (fdx / fdist) * pf;
+                d.vy += (fdy / fdist) * pf;
+              }
+              // mouth open: push away from face
+              if (mouthF > 0.3) {
+                const fdx = d.x - faceX, fdy = d.y - faceY;
+                const fdist = Math.sqrt(fdx * fdx + fdy * fdy) + 1;
+                const mf = mouthF * 0.9;
+                d.vx += (fdx / fdist) * mf;
+                d.vy += (fdy / fdist) * mf;
+              }
+            }
+
+            // damping
+            d.vx *= damp;
+            d.vy *= damp;
+
+            d.x += d.vx;
+            d.y += d.vy;
+
+            // wrap off-screen dots back in
+            if (d.x < -20) d.x = p.width + 20;
+            if (d.x > p.width + 20) d.x = -20;
+            if (d.y < -20) d.y = p.height + 20;
+            if (d.y > p.height + 20) d.y = -20;
+          }
+        }
+
+        function drawDots(g) {
+          // fast path: raw canvas 2D, one fillStyle set, no glow, no p5 state churn
+          const ctx = g.drawingContext;
+          ctx.fillStyle = "#ffffff";
+          for (let i = 0; i < dots.length; i++) {
+            const d = dots[i];
+            ctx.fillRect(d.x | 0, d.y | 0, 1, 1);
+          }
+        }
+
+        function initNoiseParticles() {
+          noiseParticles = [];
+          for (let i = 0; i < 40; i++) {
+            noiseParticles.push({
+              x: Math.random() * p.width,
+              y: Math.random() * p.height,
+              vx: (Math.random() - 0.5) * 0.3,
+              vy: (Math.random() - 0.5) * 0.3,
+              size: 1,
+              alpha: 30 + Math.random() * 50
+            });
+          }
+        }
+
+        function spawnBurst(x, y) {
+          for (let i = 0; i < 16; i++) {
+            const a = p.random(p.TWO_PI);
+            const sp = p.random(1.5, 4);
+            burstParticles.push({
+              x, y,
+              vx: Math.cos(a) * sp,
+              vy: Math.sin(a) * sp,
+              life: 60,
+              maxLife: 60,
+              size: p.random(1.5, 3)
+            });
+          }
+        }
+
+        p.setup = function () {
+          p.createCanvas(window.innerWidth, window.innerHeight);
+          p.pixelDensity(1);
+          graphLayer = p.createGraphics(window.innerWidth, window.innerHeight);
+          graphLayer.pixelDensity(1);
+          regen();
+          initDots();
+          initNoiseParticles();
+          modeChangeTime = p.millis();
+          recBtn.style.display = "block";
+          document.getElementById("faceBtn").style.display = "block";
+          document.getElementById("camBtn").style.display = "block";
+          log("p5 setup " + window.innerWidth + "x" + window.innerHeight);
+        };
+
+        p.windowResized = function () {
+          p.resizeCanvas(window.innerWidth, window.innerHeight);
+          graphLayer = p.createGraphics(window.innerWidth, window.innerHeight);
+          graphLayer.pixelDensity(1);
+          initDots();
+          initNoiseParticles();
+        };
+
+        // ===== main draw =====
+        p.draw = function () {
+          // adaptive quality after 3s warmup
+          if (!autoAdjustDone && p.millis() > 3000) {
+            autoAdjustDone = true;
+            const fps = p.frameRate();
+            let target = NUM_DOTS;
+            if (fps >= 55) target = 500;
+            else if (fps >= 40) target = 350;
+            else if (fps >= 25) target = 200;
+            else target = 120;
+            if (target !== NUM_DOTS) {
+              NUM_DOTS = target;
+              initDots();
+              log("auto-quality: fps=" + fps.toFixed(0) + " dots=" + NUM_DOTS);
+            } else {
+              log("auto-quality: fps=" + fps.toFixed(0) + " dots=" + NUM_DOTS);
+            }
+          }
+
+          // main canvas: black bg (fresh)
+          p.background(0);
+
+          // webcam behind everything (togglable)
+          if (state.camOn && state.video && state.video.videoWidth > 0) {
+            const v = state.video;
+            const vw = p.width;
+            const vh = p.width * (v.videoHeight / v.videoWidth);
+            const vy = (p.height - vh) / 2;
+            p.push();
+            p.drawingContext.save();
+            p.drawingContext.globalAlpha = 0.28;
+            p.drawingContext.translate(p.width, 0);
+            p.drawingContext.scale(-1, 1);
+            p.drawingContext.drawImage(v, 0, vy, vw, vh);
+            p.drawingContext.restore();
+            p.pop();
+          }
+
+          // ambient noise particles
+          drawNoise();
+
+          // --- graph layer with trail ---
+          // use destination-out compositing so old pixels actually ERASE,
+          // instead of being darkened on top of bright white accumulation
+          {
+            const gctx = graphLayer.drawingContext;
+            gctx.save();
+            gctx.globalCompositeOperation = "destination-out";
+            gctx.fillStyle = "rgba(0,0,0,0.25)";
+            gctx.fillRect(0, 0, graphLayer.width, graphLayer.height);
+            gctx.restore();
+          }
+
+          // collect hand anchors + gestures
+          const hands = state.hands || [];
+          const infos = state.handInfos || [];
+
+          // handle gesture events + pinch-to-switch
+          for (let hi = 0; hi < hands.length; hi++) {
+            const h = hands[hi];
+            const info = infos[hi];
+            const g = info?.name || "unknown";
+            if (!h || h.length < 21) continue;
+
+            const ix = (1 - h[8].x) * p.width;
+            const iy = h[8].y * p.height;
+            const tx = (1 - h[4].x) * p.width;
+            const ty = h[4].y * p.height;
+            const pDist = p.dist(ix, iy, tx, ty);
+
+            const wasPinch = pinchState[hi] || false;
+            const isPinch  = g === "pinch" || pDist < 45;
+
+            if (isPinch && !wasPinch && (pinchCool[hi] || 0) <= 0) {
+              pinchState[hi] = true;
+              pinchCool[hi] = 30;
+              spawnBurst((ix + tx) / 2, (iy + ty) / 2);
+              window.__audio?.playPinch();
+              mode = (mode + 1) % 3;
+              regen();
+              modeChangeTime = p.millis();
+              window.__audio?.playModeChange(mode);
+            }
+            if (!isPinch) pinchState[hi] = false;
+            if (pinchCool[hi] > 0) pinchCool[hi]--;
+
+            // --- gesture-triggered effects (only on transition, not hold) ---
+            if (g !== lastGesture[hi]) {
+              if (g === "fist") {
+                mode = 0;
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playModeChange(0);
+                spawnBurst(ix, iy);
+              } else if (g === "open") {
+                regen(); modeChangeTime = p.millis();
+              } else if (g === "peace") {
+                mode = (mode - 1 + 3) % 3;
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playModeChange(mode);
+              } else if (g === "rock") {
+                // rock: jump to distributed mode
+                mode = 2;
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playModeChange(2);
+                spawnBurst(ix, iy);
+              } else if (g === "shaka") {
+                // shaka: regenerate only (wave-like reset)
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playPinch();
+              } else if (g === "thumbsup") {
+                // thumbs up: jump to centralized
+                mode = 0;
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playModeChange(0);
+              } else if (g === "three") {
+                mode = 1;
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playModeChange(1);
+              } else if (g === "four") {
+                mode = 2;
+                regen(); modeChangeTime = p.millis();
+                window.__audio?.playModeChange(2);
+              }
+            }
+            lastGesture[hi] = g;
+          }
+
+          // ===== face events =====
+          const fe = state.faceEvents || {};
+          // Both-eye blink → cycle mode (+1). Debounced with blinkCool.
+          if (fe.bothBlink && !lastBothBlink && blinkCool <= 0) {
+            mode = (mode + 1) % 3;
+            regen(); modeChangeTime = p.millis();
+            window.__audio?.playModeChange(mode);
+            blinkCool = 45;
+            // quick ripple from nose
+            if (state.face && state.face[1]) {
+              const fx = (1 - state.face[1].x) * p.width;
+              const fy = state.face[1].y * p.height;
+              spawnBurst(fx, fy);
+            }
+          }
+          lastBothBlink = !!fe.bothBlink;
+          if (blinkCool > 0) blinkCool--;
+
+          // Mouth open (jawOpen > threshold) on transition → outward burst
+          const mouthNow = (fe.mouthOpen || 0) > 0.4;
+          if (mouthNow && !lastMouthOpen && state.face && state.face[13]) {
+            const fx = (1 - state.face[13].x) * p.width;
+            const fy = state.face[13].y * p.height;
+            spawnBurst(fx, fy);
+            window.__audio?.playPinch();
+          }
+          lastMouthOpen = mouthNow;
+
+          // Pucker transition → regenerate (like shaka)
+          const puckerNow = (fe.pucker || 0) > 0.55;
+          if (puckerNow && !lastPucker) {
+            regen(); modeChangeTime = p.millis();
+            window.__audio?.playPinch();
+          }
+          lastPucker = puckerNow;
+
+          // choose primary anchor (first hand's index)
+          let anchorX = p.width / 2, anchorY = p.height / 2;
+          let hasAnchor = false;
+          if (hands.length > 0 && hands[0] && hands[0][8]) {
+            anchorX = (1 - hands[0][8].x) * p.width;
+            anchorY = hands[0][8].y * p.height;
+            hasAnchor = true;
+          }
+
+          // update + draw particle dots on graph layer (with trail feedback)
+          updateDots(hands, mode);
+          drawDots(graphLayer);
+
+          // composite graph layer onto main canvas
+          p.image(graphLayer, 0, 0);
+
+          // corner brackets (on top of graph)
+          drawBrackets();
+
+          // side annotation notes
+          drawSideNotes();
+
+          // top-right mode preview panel
+          drawModePanel();
+
+          // finger indicators (both hands)
+          drawHandIndicators(hands, infos);
+
+          // face indicators
+          drawFaceIndicators();
+
+          // burst particles
+          drawBurst();
+
+          // mode labels
+          drawLabels();
+
+          // status
+          drawStatus(infos);
+        };
+
+        // ===== drawing helpers =====
+        function drawNoise() {
+          const ctx = p.drawingContext;
+          const w = p.width, h = p.height;
+          for (let i = 0; i < noiseParticles.length; i++) {
+            const np = noiseParticles[i];
+            np.x += np.vx; np.y += np.vy;
+            if (np.x < 0) np.x += w; else if (np.x > w) np.x -= w;
+            if (np.y < 0) np.y += h; else if (np.y > h) np.y -= h;
+            ctx.fillStyle = "rgba(255,255,255," + (np.alpha / 255).toFixed(2) + ")";
+            ctx.fillRect(np.x | 0, np.y | 0, 1, 1);
+          }
+        }
+
+        function drawBrackets() {
+          const m = 60, len = 28;
+          p.stroke(255, 220); p.strokeWeight(1); p.noFill();
+          p.line(m, m, m + len, m); p.line(m, m, m, m + len);
+          p.line(p.width - m, m, p.width - m - len, m); p.line(p.width - m, m, p.width - m, m + len);
+          p.line(m, p.height - m, m + len, p.height - m); p.line(m, p.height - m, m, p.height - m - len);
+          p.line(p.width - m, p.height - m, p.width - m - len, p.height - m); p.line(p.width - m, p.height - m, p.width - m, p.height - m - len);
+          p.noStroke(); p.fill(255, 80, 80); p.circle(m + 2, m + 2, 5);
+        }
+
+        function drawDashedLine(x1, y1, x2, y2, dashLen, gapLen) {
+          const dist = Math.hypot(x2 - x1, y2 - y1);
+          if (dist < 1) return;
+          const dx = (x2 - x1) / dist, dy = (y2 - y1) / dist;
+          const step = dashLen + gapLen;
+          const n = Math.floor(dist / step);
+          for (let i = 0; i < n; i++) {
+            const sx = x1 + dx * i * step;
+            const sy = y1 + dy * i * step;
+            p.line(sx, sy, sx + dx * dashLen, sy + dy * dashLen);
+          }
+        }
+
+        function drawSideNotes() {
+          p.textFont("Courier New");
+          p.textSize(11);
+          for (const note of activeNotes) {
+            const age = (p.millis() - note.bornAt) / 1000;
+            const alpha = p.constrain(age * 180, 0, note.isBracket ? 220 : 190);
+
+            const mx = note.x + (note.side === "left" ? -10 : 10);
+            const my = note.y + 5;
+
+            // Red square marker (signature element)
+            p.noStroke();
+            p.fill(255, 70, 70, alpha);
+            p.rect(mx - 3, my - 3, 6, 6);
+
+            // Dashed leader line outward
+            p.stroke(255, alpha * 0.25);
+            p.strokeWeight(1);
+            const to = note.x + (note.side === "left" ? -90 : 90);
+            drawDashedLine(mx + (note.side === "left" ? -4 : 4), my, to, my, 3, 3);
+
+            // Text (cyan for bracket categories, white for regular)
+            p.noStroke();
+            if (note.isBracket) {
+              p.fill(140, 230, 200, alpha);     // category cyan-green
+              p.textFont("Courier New");
+              p.textSize(11);
+            } else {
+              p.fill(255, alpha);
+              p.textSize(11);
+            }
+            p.textAlign(note.side === "left" ? p.LEFT : p.RIGHT, p.TOP);
+            for (let li = 0; li < note.text.length; li++) {
+              p.text(note.text[li], note.x, note.y + li * 14);
+            }
+          }
+        }
+
+        const FINGER_LABELS = ["T", "I", "M", "R", "P"];
+        function drawHandIndicators(hands, infos) {
+          for (let i = 0; i < hands.length; i++) {
+            const h = hands[i];
+            if (!h || h.length < 21) continue;
+            const info = infos[i] || { name: "—", ext: {} };
+            const ext = info.ext || {};
+
+            // palm center
+            const px = (1 - h[0].x) * p.width;
+            const py = h[0].y * p.height;
+
+            // per-finger indicators
+            for (let f = 0; f < 5; f++) {
+              const tipIdx = FINGER_TIPS[f];
+              const fx = (1 - h[tipIdx].x) * p.width;
+              const fy = h[tipIdx].y * p.height;
+              const on = !!ext[FINGER_KEYS[f]];
+
+              p.noStroke();
+              if (on) {
+                p.fill(255);
+                p.circle(fx, fy, 8);
+                p.noFill();
+                p.stroke(255, 140);
+                p.strokeWeight(1);
+                p.circle(fx, fy, 22);
+              } else {
+                p.fill(255, 80);
+                p.circle(fx, fy, 4);
+              }
+
+              // label
+              p.noStroke();
+              p.fill(255, on ? 230 : 90);
+              p.textFont("Courier New");
+              p.textSize(10);
+              p.textAlign(p.CENTER, p.TOP);
+              p.text(FINGER_LABELS[f], fx, fy + 12);
+
+              // faint line from palm to extended tips
+              if (on) {
+                p.stroke(255, 70);
+                p.strokeWeight(1);
+                p.line(px, py, fx, fy);
+              }
+            }
+
+            // pinch visual (thumb-index)
+            const ix = (1 - h[8].x) * p.width;
+            const iy = h[8].y * p.height;
+            const tx = (1 - h[4].x) * p.width;
+            const ty = h[4].y * p.height;
+            const pd = p.dist(ix, iy, tx, ty);
+            if (pd < 90) {
+              p.stroke(255, p.map(pd, 0, 90, 255, 30));
+              p.line(ix, iy, tx, ty);
+            }
+
+            // gesture name under palm
+            p.noStroke();
+            p.fill(255, 220);
+            p.textFont("Courier New");
+            p.textSize(11);
+            p.textAlign(p.CENTER, p.TOP);
+            p.text(info.name.toUpperCase(), px, py + 32);
+          }
+        }
+
+        function drawBurst() {
+          p.noStroke();
+          for (let i = burstParticles.length - 1; i >= 0; i--) {
+            const b = burstParticles[i];
+            b.x += b.vx; b.y += b.vy;
+            b.vx *= 0.95; b.vy *= 0.95;
+            b.life--;
+            if (b.life <= 0) { burstParticles.splice(i, 1); continue; }
+            const alpha = (b.life / b.maxLife) * 255;
+            p.fill(255, alpha);
+            p.circle(b.x, b.y, b.size);
+          }
+        }
+
+        function drawLabels() {
+          const el = (p.millis() - modeChangeTime) / 1000;
+          const full = `${MODE_NAMES[mode]}: ${MODE_DESC[mode]}`;
+          const n = p.floor(el * 28);
+          p.noStroke(); p.fill(255);
+          p.textFont("Courier New"); p.textSize(18);
+          p.textAlign(p.LEFT, p.BOTTOM);
+          p.text(full.substring(0, p.min(n, full.length)), 80, p.height - 100);
+
+          // blinking cursor while typing
+          if (n < full.length && p.frameCount % 30 < 15) {
+            const cursorX = 80 + p.textWidth(full.substring(0, n));
+            p.rect(cursorX + 2, p.height - 117, 10, 2);
+          }
+
+          // mode tick marks below typewriter text
+          for (let i = 0; i < 3; i++) {
+            const x = 80 + i * 24, y = p.height - 70;
+            p.stroke(i === mode ? 255 : p.color(255, 80));
+            p.strokeWeight(i === mode ? 2 : 1);
+            p.line(x, y, x + 16, y);
+          }
+        }
+
+        // Key MediaPipe face-mesh landmark indices
+        const FACE_LEFT_EYE   = [33, 160, 158, 133, 153, 144];     // closed loop
+        const FACE_RIGHT_EYE  = [362, 385, 387, 263, 373, 380];
+        const FACE_LIPS_OUTER = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409,
+                                 291, 375, 321, 405, 314, 17, 84, 181, 91, 146];
+        const FACE_LEFT_BROW  = [70, 63, 105, 66, 107];
+        const FACE_RIGHT_BROW = [336, 296, 334, 293, 300];
+        const FACE_OVAL       = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323,
+                                 361, 288, 397, 365, 379, 378, 400, 377, 152,
+                                 148, 176, 149, 150, 136, 172, 58, 132, 93, 234,
+                                 127, 162, 21, 54, 103, 67, 109];
+
+        function drawPoly(indices, face, strokeCol, weight, close) {
+          p.noFill();
+          p.stroke(strokeCol);
+          p.strokeWeight(weight);
+          p.beginShape();
+          for (const i of indices) {
+            if (!face[i]) continue;
+            p.vertex((1 - face[i].x) * p.width, face[i].y * p.height);
+          }
+          if (close) p.endShape(p.CLOSE); else p.endShape();
+        }
+
+        function drawFaceIndicators() {
+          const face = state.face;
+          if (!face || face.length < 400) return;
+          const fe = state.faceEvents || {};
+
+          // Very faint face oval outline
+          drawPoly(FACE_OVAL, face, p.color(255, 40), 1, true);
+
+          // Eyes — brighter when open, dim/closed when blinking
+          const eyeAlphaL = (1 - (fe.blinkL || 0)) * 200 + 30;
+          const eyeAlphaR = (1 - (fe.blinkR || 0)) * 200 + 30;
+          drawPoly(FACE_LEFT_EYE,  face, p.color(255, eyeAlphaL), 1.5, true);
+          drawPoly(FACE_RIGHT_EYE, face, p.color(255, eyeAlphaR), 1.5, true);
+
+          // Lips — scale alpha with smile, thickness with mouthOpen
+          const lipA = 120 + (fe.smile || 0) * 120;
+          const lipW = 1 + (fe.mouthOpen || 0) * 2;
+          drawPoly(FACE_LIPS_OUTER, face, p.color(255, lipA), lipW, true);
+
+          // Brows — color shifts: up=cyan, down=red
+          const bMod = (fe.browUp || 0) - (fe.browDown || 0); // -1..+1
+          let browCol;
+          if (bMod > 0.15)      browCol = p.color(140, 255, 255, 220);   // brows up = cyan
+          else if (bMod < -0.15) browCol = p.color(255, 120, 120, 220);  // brows down = red
+          else                   browCol = p.color(255, 160);
+          drawPoly(FACE_LEFT_BROW,  face, browCol, 1.5, false);
+          drawPoly(FACE_RIGHT_BROW, face, browCol, 1.5, false);
+
+          // Wink highlight: pulsing ring on winking eye
+          const winkL = (fe.blinkL || 0) > 0.55 && (fe.blinkR || 0) < 0.35;
+          const winkR = (fe.blinkR || 0) > 0.55 && (fe.blinkL || 0) < 0.35;
+          if (winkL || winkR) {
+            const iris = winkL ? (face[468] || face[33]) : (face[473] || face[263]);
+            if (iris) {
+              const ex = (1 - iris.x) * p.width;
+              const ey = iris.y * p.height;
+              const pulse = 30 + Math.sin(p.millis() * 0.02) * 10;
+              p.noFill();
+              p.stroke(255, 200);
+              p.strokeWeight(1.5);
+              p.circle(ex, ey, pulse);
+              p.stroke(255, 80);
+              p.circle(ex, ey, pulse * 2);
+            }
+          }
+
+          // Small readout above nose (landmark 1 = nose tip)
+          if (face[1]) {
+            const nx = (1 - face[1].x) * p.width;
+            const ny = face[1].y * p.height;
+            p.noStroke();
+            p.fill(255, 220);
+            p.textFont("Courier New");
+            p.textSize(10);
+            p.textAlign(p.CENTER, p.BOTTOM);
+            const tag =
+              winkL ? "WINK ← L" :
+              winkR ? "WINK R →" :
+              fe.bothBlink ? "BLINK!" :
+              (fe.mouthOpen || 0) > 0.5 ? "MOUTH OPEN" :
+              (fe.pucker || 0) > 0.5 ? "PUCKER" :
+              (fe.smile || 0) > 0.4 ? "SMILE" :
+              (fe.browUp || 0) > 0.3 ? "BROWS ↑" :
+              (fe.browDown || 0) > 0.3 ? "BROWS ↓" : "";
+            if (tag) p.text(tag, nx, ny - 60);
+          }
+        }
+
+        // ===== top-right mode preview panel (mini-diagram + info) =====
+        function drawModePanel() {
+          // Positioned on right side, below "TOPOLOGIES OF THOUGHTS" title (~y=60)
+          const panelW = 180;
+          const panelH = 200;
+          const panelX = p.width - panelW - 30;
+          const panelY = 100;
+
+          // corner-bracket mini frame
+          const tick = 10;
+          p.stroke(255, 180); p.strokeWeight(1); p.noFill();
+          // TL
+          p.line(panelX, panelY, panelX + tick, panelY);
+          p.line(panelX, panelY, panelX, panelY + tick);
+          // TR
+          p.line(panelX + panelW, panelY, panelX + panelW - tick, panelY);
+          p.line(panelX + panelW, panelY, panelX + panelW, panelY + tick);
+          // BL
+          p.line(panelX, panelY + panelH, panelX + tick, panelY + panelH);
+          p.line(panelX, panelY + panelH, panelX, panelY + panelH - tick);
+          // BR
+          p.line(panelX + panelW, panelY + panelH, panelX + panelW - tick, panelY + panelH);
+          p.line(panelX + panelW, panelY + panelH, panelX + panelW, panelY + panelH - tick);
+
+          // mini diagram (constant shape so it reads as an icon)
+          const cx = panelX + panelW / 2;
+          const cy = panelY + 55;
+          const r  = 38;
+          drawMiniDiagram(cx, cy, r, mode);
+
+          // mode info block below diagram
+          const tx = panelX + 12;
+          let ty = panelY + 112;
+          p.noStroke();
+          p.fill(255, 230);
+          p.textFont("Courier New");
+          p.textSize(11);
+          p.textAlign(p.LEFT, p.TOP);
+          p.text("mode: " + MODE_NAMES[mode], tx, ty);
+
+          // wrapped description
+          p.fill(200, 220);
+          p.textSize(10);
+          ty += 16;
+          const desc = MODE_DESC[mode];
+          const maxChars = 22;
+          const words = desc.split(" ");
+          let line = "";
+          for (const w of words) {
+            if ((line + " " + w).trim().length > maxChars) {
+              p.text(line, tx, ty);
+              ty += 12;
+              line = w;
+            } else {
+              line = (line + " " + w).trim();
+            }
+          }
+          if (line) p.text(line, tx, ty);
+        }
+
+        function drawMiniDiagram(cx, cy, r, mode) {
+          p.noFill();
+          if (mode === 0) {
+            // centralized: 18 symmetric rays
+            const rays = 18;
+            for (let i = 0; i < rays; i++) {
+              const a = (i / rays) * p.TWO_PI;
+              const len = r * (0.8 + (i % 2) * 0.2);
+              const ex = cx + Math.cos(a) * len;
+              const ey = cy + Math.sin(a) * len;
+              p.stroke(255, 220); p.strokeWeight(1);
+              p.line(cx, cy, ex, ey);
+              p.noStroke(); p.fill(255);
+              p.rect(ex - 1, ey - 1, 2, 2);
+            }
+            p.noStroke(); p.fill(255);
+            p.circle(cx, cy, 4);
+          } else if (mode === 1) {
+            // decentralized: 4 mini constellations
+            const clusterCount = 4;
+            for (let c = 0; c < clusterCount; c++) {
+              const a = (c / clusterCount) * p.TWO_PI - p.HALF_PI;
+              const hx = cx + Math.cos(a) * r * 0.55;
+              const hy = cy + Math.sin(a) * r * 0.55;
+              for (let i = 0; i < 4; i++) {
+                const ia = (i / 4) * p.TWO_PI + c * 0.7;
+                const rr = r * 0.2;
+                const px = hx + Math.cos(ia) * rr;
+                const py = hy + Math.sin(ia) * rr;
+                p.stroke(255, 200); p.strokeWeight(1);
+                p.line(hx, hy, px, py);
+                p.noStroke(); p.fill(255);
+                p.rect(px - 1, py - 1, 2, 2);
+              }
+              p.noStroke(); p.fill(255);
+              p.circle(hx, hy, 3);
+            }
+          } else {
+            // distributed: fixed mesh of 9 points
+            const pts = [];
+            for (let i = 0; i < 9; i++) {
+              const a = (i / 9) * p.TWO_PI;
+              const rr = r * (0.5 + 0.4 * ((i * 1234567 % 100) / 100));
+              pts.push({ x: cx + Math.cos(a) * rr, y: cy + Math.sin(a) * rr });
+            }
+            for (let i = 0; i < pts.length; i++) {
+              for (let j = i + 1; j < pts.length; j++) {
+                const dd = p.dist(pts[i].x, pts[i].y, pts[j].x, pts[j].y);
+                if (dd < r * 0.9) {
+                  p.stroke(255, 160); p.strokeWeight(1);
+                  p.line(pts[i].x, pts[i].y, pts[j].x, pts[j].y);
+                }
+              }
+            }
+            p.noStroke(); p.fill(255);
+            for (const pt of pts) p.rect(pt.x - 1, pt.y - 1, 2, 2);
+          }
+        }
+
+        function drawStatus(infos) {
+          // bottom-left panel, above #debugLog div
+          const panelH = 176;
+          const panelW = 252;
+          const panelX = 8;
+          const panelY = p.height - panelH - 70;  // leaves room for debug log below
+
+          p.noStroke();
+          p.fill(0, 0, 0, 180);
+          p.rect(panelX, panelY, panelW, panelH);
+          p.textFont("Courier New");
+          p.textAlign(p.LEFT, p.TOP); p.textSize(11);
+
+          const tx = panelX + 10;
+          let y = panelY + 6;
+
+          p.fill(state.mpReady ? "#0f0" : "#ff0");
+          p.text("MP: " + (state.mpReady ? "READY" : "LOADING..."), tx, y); y += 16;
+
+          p.fill(state.hands.length ? "#0f0" : "#f88");
+          p.text("HANDS: " + state.hands.length, tx, y); y += 16;
+
+          p.fill("#aaa");
+          const gStr = infos.map(i => i?.name || "?").join(" | ");
+          p.text("G: " + (gStr || "—"), tx, y); y += 16;
+
+          // per-finger status per hand
+          p.fill("#0ff");
+          p.text("FINGERS:", tx, y);
+          for (let hi = 0; hi < infos.length; hi++) {
+            const ext = infos[hi]?.ext || {};
+            let fx = tx + 72 + hi * 100;
+            for (let f = 0; f < 5; f++) {
+              const on = !!ext[FINGER_KEYS[f]];
+              p.fill(on ? "#0ff" : "#355");
+              p.text(FINGER_LABELS[f], fx, y);
+              fx += 14;
+            }
+          }
+          y += 16;
+
+          let activeFingers = 0;
+          for (const info of infos) {
+            if (!info?.ext) continue;
+            for (const k of FINGER_KEYS) if (info.ext[k]) activeFingers++;
+          }
+          p.fill("#aaa");
+          p.text("ACTIVE ATTRACTORS: " + activeFingers, tx, y); y += 16;
+
+          // divider
+          p.stroke(80); p.strokeWeight(1);
+          p.line(tx, y + 2, panelX + panelW - 10, y + 2);
+          p.noStroke();
+          y += 8;
+
+          // face section
+          const fe = state.faceEvents || {};
+          p.fill(state.face ? "#f0f" : (state.faceOn ? "#f80" : "#533"));
+          const faceLabel = !state.faceOn ? "FACE: OFF" : (state.face ? "FACE: TRACKING" : "FACE: ON (no face)");
+          p.text(faceLabel, tx, y); y += 16;
+
+          const bar = (label, val, yy, col) => {
+            p.fill("#aaa");
+            p.text(label, tx, yy);
+            p.fill(70);
+            p.rect(tx + 88, yy + 2, 140, 8);
+            p.fill(col);
+            p.rect(tx + 88, yy + 2, 140 * Math.min(1, val), 8);
+          };
+          bar("BLINK L", fe.blinkL || 0, y, "#8cf");     y += 14;
+          bar("BLINK R", fe.blinkR || 0, y, "#8cf");     y += 14;
+          bar("MOUTH",   fe.mouthOpen || 0, y, "#fc8"); y += 14;
+          bar("PUCKER",  fe.pucker || 0, y, "#f8c");
+        }
+      });
+    }
+
+    async function boot() {
+      btn.style.display = "none";
+      initAudio();
+      try {
+        await startCamera();
+        startSketch();
+        await startMediaPipe(state.video);
+      } catch (err) {
+        log("ERROR: " + (err.name || "") + " " + err.message);
+        btn.style.display = "block";
+        btn.innerText = "⚠ RETRY";
+      }
+    }
+
+    btn.addEventListener("click", boot);
+    log("click button to start");
+  </script>
+</body>
+</html>

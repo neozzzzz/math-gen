@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Vertical Ripple — Hand Tracking</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    color: #fff;
+  }
+  #webcam { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #glCanvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  #title {
+    position: fixed; top: 20px; left: 120px;
+    font-size: 13px; letter-spacing: 0.25em; color: #aaa;
+    z-index: 10; pointer-events: none;
+  }
+  #hint {
+    position: fixed; top: 20px; right: 30px;
+    font-size: 10px; letter-spacing: 0.15em; color: #666;
+    z-index: 10; pointer-events: none; text-align: right; line-height: 1.7;
+  }
+  #debugLog {
+    position: fixed; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #0f0;
+    padding: 6px 10px; border: 1px solid #333;
+    font-size: 10px; white-space: pre; z-index: 200;
+    max-width: 320px; line-height: 1.5;
+  }
+  #startBtn {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: #fff; color: #000; border: none;
+    padding: 20px 40px; font-size: 16px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 150;
+  }
+  #menuLink {
+    position: fixed; top: 14px; left: 14px;
+    z-index: 250; font: 10px 'Courier New', monospace;
+    letter-spacing: 0.2em; color: #aaa;
+    text-decoration: none; border: 1px solid #444;
+    padding: 6px 10px; background: rgba(0,0,0,0.5);
+  }
+  #recBtn {
+    position: fixed; bottom: 16px; left: 50%;
+    transform: translateX(-50%);
+    background: transparent; color: #fff;
+    border: 1px solid #555;
+    padding: 8px 18px; font-size: 11px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 25;
+    transition: all 0.15s;
+  }
+  #recBtn.recording { background: #c22; border-color: #f44; }
+  #recBtn:hover { border-color: #aaa; }
+  #recFmt {
+    position: fixed; bottom: 18px; left: calc(50% + 110px);
+    font: 9px monospace; color: #555;
+    letter-spacing: 0.2em; z-index: 25;
+  }
+  /* --- Debug overlay --- */
+  #hud {
+    position: fixed; top: 60px; left: 14px;
+    z-index: 300;
+    color: #0f0; font: 11px 'Courier New', monospace;
+    background: rgba(0,0,0,0.75);
+    padding: 10px 12px;
+    border: 1px solid #0a0;
+    white-space: pre; line-height: 1.45;
+    pointer-events: none;
+  }
+  .handmark {
+    position: fixed; width: 28px; height: 28px;
+    margin-left: -14px; margin-top: -14px;
+    border: 2px solid #ff3;
+    border-radius: 50%;
+    pointer-events: none; z-index: 250;
+    display: none;
+  }
+  .handmark.fist { border-color: #f6a; background: rgba(255,100,170,0.15); }
+  .pulsecol {
+    position: fixed;
+    top: 0; bottom: 0;
+    width: 14vw;
+    margin-left: -7vw;
+    background: rgba(120,200,255,0.06);
+    border-left:  1px dashed rgba(120,200,255,0.5);
+    border-right: 1px dashed rgba(120,200,255,0.5);
+    pointer-events: none; z-index: 240;
+    display: none;
+  }
+  #trigFlash {
+    position: fixed; inset: 0; pointer-events: none;
+    z-index: 260; display: none;
+    box-shadow: inset 0 0 80px 20px rgba(255,255,100,0.5);
+  }
+  #manualHint {
+    position: fixed; bottom: 50px; left: 14px;
+    font: 10px monospace; color: #888;
+    z-index: 25; pointer-events: none;
+    background: rgba(0,0,0,0.4); padding: 4px 8px;
+    border: 1px solid #333;
+  }
+</style>
+</head>
+<body>
+  <a href="index.html" id="menuLink">← MENU</a>
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="glCanvas"></canvas>
+  <div id="title">VERTICAL RIPPLE</div>
+  <div id="hint">
+    FIST → VERTICAL RIPPLE COLUMN<br/>
+    POINT (INDEX ONLY) → BLACK HOLE AT TIP
+  </div>
+  <div id="debugLog">booting...</div>
+  <button id="startBtn">▶ START</button>
+  <button id="recBtn" style="display:none">● RECORD</button>
+  <div id="recFmt"></div>
+  <div id="hud">initializing…</div>
+  <div id="handMark0" class="handmark"></div>
+  <div id="handMark1" class="handmark"></div>
+  <div id="pulseCol0" class="pulsecol"></div>
+  <div id="pulseCol1" class="pulsecol"></div>
+  <div id="trigFlash"></div>
+  <div id="manualHint">SPACE / CLICK = manual pulse · 1=wide · 2=narrow</div>
+
+  <script type="module">
+    const dbg = document.getElementById("debugLog");
+    const btn = document.getElementById("startBtn");
+    const logs = [];
+    function log(msg) {
+      logs.push(msg);
+      if (logs.length > 10) logs.shift();
+      dbg.innerText = logs.join("\n");
+      console.log("[boot]", msg);
+    }
+    window.addEventListener("error", (e) => log("ERR: " + e.message));
+    window.addEventListener("unhandledrejection", (e) => log("PROMISE ERR: " + (e.reason?.message || e.reason)));
+
+    // ===== Shader: vertical water-column ripple =====
+    const VERT_SRC = `
+      attribute vec2 a_position;
+      varying vec2 vUv;
+      void main() {
+        vec2 uv = (a_position + 1.0) * 0.5;
+        vUv = vec2(1.0 - uv.x, 1.0 - uv.y);  // mirror + flip
+        gl_Position = vec4(a_position, 0.0, 1.0);
+      }
+    `;
+    const FRAG_SRC = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uVideo;
+      uniform vec2  uCenter0;
+      uniform vec2  uCenter1;
+      uniform float uPulse0;    // 0..1 — ripple amplitude (fist)
+      uniform float uPulse1;
+      uniform vec2  uTip0;      // index-fingertip position (point gesture)
+      uniform vec2  uTip1;
+      uniform float uBh0;       // 0..1 — black-hole strength (point)
+      uniform float uBh1;
+      uniform vec2  uAspect;    // (screenW/screenH, 1.0) — keep warp circular
+      uniform float uTime;
+
+      // ---------- Vertical column ripple (fist gesture) ----------
+      vec2 vRipple(vec2 uv, vec2 center, float pulse) {
+        if (pulse < 0.01) return uv;
+
+        float colWidth = 0.18;
+        float dx = abs(uv.x - center.x);
+        float hFall = smoothstep(colWidth, 0.0, dx);
+        if (hFall < 0.001) return uv;
+
+        float dy = abs(uv.y - center.y);
+        float vFall = smoothstep(0.55, 0.0, dy);
+
+        float amp = pulse * hFall * (0.35 + vFall * 0.65) * 0.065;
+        float w = sin(uv.y * 30.0 + uTime * 5.8) * 0.5
+                + sin(uv.y * 16.0 - uTime * 3.6) * 0.35
+                + sin(uv.y *  8.0 + uTime * 2.0) * 0.25;
+        return vec2(uv.x - w * amp, uv.y);
+      }
+
+      // ---------- Black-hole lensing at fingertip (point gesture) ----------
+      vec2 bhWarp(vec2 uv, vec2 center, float s) {
+        if (s < 0.02) return uv;
+        vec2 d = (uv - center) * uAspect;
+        float r = length(d);
+        float EH = 0.28;
+        float falloff = smoothstep(EH, 0.0, r);
+        if (falloff < 0.001) return uv;
+        float breath = 0.88 + 0.12 * sin(uTime * 2.8 + center.x * 17.0);
+        float S = s * breath * falloff;
+        float a = atan(d.y, d.x) + S * 3.4;
+        float newR = r * (1.0 - S * 0.58);
+        vec2 warped = vec2(cos(a), sin(a)) * newR;
+        return center + warped / uAspect;
+      }
+      float bhDark(vec2 uv, vec2 center, float s) {
+        if (s < 0.02) return 0.0;
+        vec2 d = (uv - center) * uAspect;
+        float r = length(d);
+        float core = pow(smoothstep(0.09, 0.0, r), 1.4);
+        float halo = smoothstep(0.17, 0.06, r) * 0.25;
+        return (core + halo) * s;
+      }
+      vec3 bhRing(vec2 uv, vec2 center, float s) {
+        if (s < 0.04) return vec3(0.0);
+        vec2 d = (uv - center) * uAspect;
+        float r = length(d);
+        float ring = smoothstep(0.015, 0.0, abs(r - 0.11))
+                   * smoothstep(0.0, 0.015, r);
+        float pulse = 0.7 + 0.3 * sin(uTime * 4.0);
+        return vec3(1.0, 0.55, 0.25) * ring * s * pulse * 0.55;
+      }
+
+      void main() {
+        vec2 uv0 = vUv;
+        vec2 uv  = uv0;
+        // apply black-hole warp first (radial) then ripple (axial)
+        uv = bhWarp(uv, uTip0, uBh0);
+        uv = bhWarp(uv, uTip1, uBh1);
+        uv = vRipple(uv, uCenter0, uPulse0);
+        uv = vRipple(uv, uCenter1, uPulse1);
+
+        float totalGrip = uPulse0 + uPulse1;
+        float totalBh   = uBh0 + uBh1;
+
+        // Ripple refraction (x-axis) + black-hole radial chromatic aberration
+        float abX = totalGrip * 0.005;
+        float abBh = 0.0;
+        abBh = max(abBh, uBh0 * smoothstep(0.22, 0.0, length((uv0 - uTip0) * uAspect)));
+        abBh = max(abBh, uBh1 * smoothstep(0.22, 0.0, length((uv0 - uTip1) * uAspect)));
+        abBh *= 0.014;
+        vec2 bhDir = normalize(uv - vec2(0.5) + 1e-6);
+
+        vec2 uvR = vec2(clamp(uv.x + abX, 0.0, 1.0), uv.y) + bhDir * abBh;
+        vec2 uvG = uv;
+        vec2 uvB = vec2(clamp(uv.x - abX, 0.0, 1.0), uv.y) - bhDir * abBh;
+        uvR = clamp(uvR, 0.0, 1.0);
+        uvB = clamp(uvB, 0.0, 1.0);
+
+        float r = texture2D(uVideo, uvR).r;
+        float g = texture2D(uVideo, uvG).g;
+        float b = texture2D(uVideo, uvB).b;
+        vec3 col = vec3(r, g, b);
+
+        // Cool tint inside the rippled column
+        float tint = totalGrip * 0.3;
+        col = mix(col, col * vec3(0.85, 0.95, 1.10), tint);
+
+        // Black-hole: event-horizon darkness
+        float dark = max(bhDark(uv0, uTip0, uBh0), bhDark(uv0, uTip1, uBh1));
+        col *= 1.0 - dark;
+
+        // Black-hole: warm photon ring
+        col += bhRing(uv0, uTip0, uBh0);
+        col += bhRing(uv0, uTip1, uBh1);
+
+        // gentle vignette
+        float vig = smoothstep(1.25, 0.35, length(uv - vec2(0.5)));
+        col *= 0.75 + vig * 0.25;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    // ===== WebGL setup =====
+    const canvas = document.getElementById("glCanvas");
+    const gl = canvas.getContext("webgl", { antialias: false, premultipliedAlpha: false });
+    if (!gl) { log("WebGL not available"); throw new Error("no webgl"); }
+
+    function compile(type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const err = gl.getShaderInfoLog(sh);
+        log("shader err: " + err);
+        throw new Error(err);
+      }
+      return sh;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER,   VERT_SRC));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG_SRC));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      log("link err: " + gl.getProgramInfoLog(prog));
+      throw new Error("link failed");
+    }
+    gl.useProgram(prog);
+
+    const aPos = gl.getAttribLocation(prog, "a_position");
+    const uVideo   = gl.getUniformLocation(prog, "uVideo");
+    const uCenter0 = gl.getUniformLocation(prog, "uCenter0");
+    const uCenter1 = gl.getUniformLocation(prog, "uCenter1");
+    const uPulse0  = gl.getUniformLocation(prog, "uPulse0");
+    const uPulse1  = gl.getUniformLocation(prog, "uPulse1");
+    const uTip0    = gl.getUniformLocation(prog, "uTip0");
+    const uTip1    = gl.getUniformLocation(prog, "uTip1");
+    const uBh0     = gl.getUniformLocation(prog, "uBh0");
+    const uBh1     = gl.getUniformLocation(prog, "uBh1");
+    const uAspect  = gl.getUniformLocation(prog, "uAspect");
+    const uTime    = gl.getUniformLocation(prog, "uTime");
+
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1,-1,  1,-1,  -1, 1,
+      -1, 1,  1,-1,   1, 1
+    ]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const videoTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, videoTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    function resizeCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width  = Math.floor(window.innerWidth  * dpr);
+      canvas.height = Math.floor(window.innerHeight * dpr);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    // ===== State =====
+    const state = {
+      video: null,
+      hands: [],
+      mpReady: false,
+      trk: [
+        { x: 0.5, y: 0.5, grip: 0, speed: 0, prevX: 0.5, active: false,
+          pulseAmp: 0, pulseX: 0.5, pulseY: 0.5, cooldown: 0,
+          gripPrime: 0, speedPrime: 0,
+          peakGrip: 0, peakSpeed: 0, peakResetAt: 0,
+          tipX: 0.5, tipY: 0.5, bhStr: 0 },
+        { x: 0.5, y: 0.5, grip: 0, speed: 0, prevX: 0.5, active: false,
+          pulseAmp: 0, pulseX: 0.5, pulseY: 0.5, cooldown: 0,
+          gripPrime: 0, speedPrime: 0,
+          peakGrip: 0, peakSpeed: 0, peakResetAt: 0,
+          tipX: 0.5, tipY: 0.5, bhStr: 0 }
+      ]
+    };
+
+    window.__state = state;  // expose for debugging
+    // Swipe-driven pulse constants
+    const PULSE_SPEED_THRESHOLD = 0.0025; // lowered
+    const PULSE_GRIP_THRESHOLD  = 0.30;   // lowered
+    const PULSE_COOLDOWN_FRAMES = 3;
+    const PULSE_DECAY           = 0.93;
+    // Priming: if grip was recently high OR speed was recently high, allow firing
+    // even if the OTHER condition only becomes true slightly later.
+    const PRIME_WINDOW_FRAMES   = 15;
+
+    async function startCamera() {
+      log("requesting camera...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      const video = document.getElementById("webcam");
+      video.srcObject = stream;
+      await new Promise(res => video.onloadedmetadata = res);
+      await video.play();
+      log("camera " + video.videoWidth + "x" + video.videoHeight);
+      state.video = video;
+      return video;
+    }
+
+    function computeGrip(hand) {
+      const w = hand[0];
+      let sum = 0;
+      for (const t of [8, 12, 16, 20]) {
+        const dx = hand[t].x - w.x;
+        const dy = hand[t].y - w.y;
+        sum += Math.sqrt(dx * dx + dy * dy);
+      }
+      const avg = sum / 4;
+      const openT = 0.28, fistT = 0.12;
+      const openness = Math.max(0, Math.min(1, (avg - fistT) / (openT - fistT)));
+      return 1.0 - openness;
+    }
+
+    function _dist(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    function straightness(hand, mcp, pip, dip, tip) {
+      const seg = _dist(hand[mcp], hand[pip])
+                + _dist(hand[pip], hand[dip])
+                + _dist(hand[dip], hand[tip]);
+      if (seg < 1e-4) return 0;
+      return _dist(hand[mcp], hand[tip]) / seg;
+    }
+    function isPointing(hand) {
+      const idx   = straightness(hand,  5,  6,  7,  8);
+      const mid   = straightness(hand,  9, 10, 11, 12);
+      const ring  = straightness(hand, 13, 14, 15, 16);
+      const pinky = straightness(hand, 17, 18, 19, 20);
+      return idx > 0.93 && mid < 0.88 && ring < 0.88 && pinky < 0.88;
+    }
+
+    async function startMediaPipe(video) {
+      log("loading MediaPipe...");
+      const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const { HandLandmarker, FilesetResolver } = mod;
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      state.mpReady = true;
+      log("MediaPipe READY");
+
+      let lastTs = -1;
+      function detect() {
+        if (video.currentTime !== lastTs) {
+          lastTs = video.currentTime;
+          const hr = handLandmarker.detectForVideo(video, performance.now());
+          state.hands = hr.landmarks || [];
+        }
+        requestAnimationFrame(detect);
+      }
+      detect();
+    }
+
+    function render() {
+      const t0 = performance.now() / 1000;
+
+      const v = state.video;
+      if (v && v.videoWidth > 0) {
+        gl.bindTexture(gl.TEXTURE_2D, videoTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, v);
+      }
+
+      // update hand tracking
+      for (let i = 0; i < 2; i++) state.trk[i].active = false;
+      for (let i = 0; i < Math.min(2, state.hands.length); i++) {
+        const h = state.hands[i];
+        if (!h || h.length < 21) continue;
+        const palm = h[9];
+        const tip  = h[8];
+        // Shader's vUv already mirrors the texture, so centers are texture-space
+        const px = palm.x;
+        const py = palm.y;
+        const tx = tip.x;
+        const ty = tip.y;
+        const grip = computeGrip(h);
+        const pointing = isPointing(h);
+        const tk = state.trk[i];
+        const prevX = tk.active ? tk.x : px;
+        tk.x    = tk.active ? tk.x * 0.7 + px * 0.3 : px;
+        tk.y    = tk.active ? tk.y * 0.7 + py * 0.3 : py;
+        tk.tipX = tk.active ? tk.tipX * 0.7 + tx * 0.3 : tx;
+        tk.tipY = tk.active ? tk.tipY * 0.7 + ty * 0.3 : ty;
+        tk.grip = tk.active ? tk.grip * 0.55 + grip * 0.45 : grip;
+        const vx = Math.abs(tk.x - prevX);
+        tk.vxRaw = vx;
+        tk.speed = Math.max(vx, tk.speed * 0.75);
+        // Black-hole strength targets 1 while pointing, else 0 (smoothed)
+        const bhTarget = pointing ? 1.0 : 0.0;
+        tk.bhStr = tk.bhStr * 0.82 + bhTarget * 0.18;
+        tk.pointing = pointing;
+        tk.active = true;
+      }
+      for (let i = 0; i < 2; i++) {
+        if (!state.trk[i].active) {
+          state.trk[i].grip  *= 0.82;
+          state.trk[i].speed *= 0.82;
+          state.trk[i].bhStr *= 0.82;
+        }
+      }
+
+      // ===== Pulse drive (simplified: fist → ripple on, release → fade) =====
+      // We throw out the complicated priming and just track grip as the direct
+      // driver of pulseAmp. Movement no longer gates it — it only makes the
+      // column visibly follow the hand, which is what "배경이 세로줄로 일그러진다"
+      // asks for. Once this is visibly working we can re-add a swipe gate.
+      for (let i = 0; i < 2; i++) {
+        const tk = state.trk[i];
+
+        // Track peaks for HUD
+        if (performance.now() - tk.peakResetAt > 2000) {
+          tk.peakGrip = 0; tk.peakSpeed = 0;
+          tk.peakResetAt = performance.now();
+        }
+        if (tk.grip  > tk.peakGrip)  tk.peakGrip  = tk.grip;
+        if (tk.speed > tk.peakSpeed) tk.peakSpeed = tk.speed;
+
+        // Kept for HUD continuity only
+        if (tk.grip  >= PULSE_GRIP_THRESHOLD)  tk.gripPrime  = PRIME_WINDOW_FRAMES;
+        else if (tk.gripPrime  > 0) tk.gripPrime--;
+        if (tk.speed >= PULSE_SPEED_THRESHOLD) tk.speedPrime = PRIME_WINDOW_FRAMES;
+        else if (tk.speedPrime > 0) tk.speedPrime--;
+        if (tk.cooldown > 0) tk.cooldown--;
+
+        // Ripple column activates on fist, suppressed while pointing
+        // (so the black-hole and the column don't stack on the same hand).
+        const target = (tk.active && tk.grip >= PULSE_GRIP_THRESHOLD && !tk.pointing) ? 1.0 : 0.0;
+        const prev   = tk.pulseAmp;
+        tk.pulseAmp  = prev * 0.82 + target * 0.18;
+
+        // Log rising edge exactly once per fist-grip cycle
+        if (prev < 0.5 && tk.pulseAmp >= 0.5) {
+          tk.fireCount = (tk.fireCount || 0) + 1;
+          lastTrigTime = performance.now();
+          console.log(`[trigger] hand ${i} fist-on #${tk.fireCount}`);
+        }
+      }
+
+      gl.uniform1i(uVideo, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, videoTex);
+      gl.uniform2f(uCenter0, state.trk[0].x, state.trk[0].y);
+      gl.uniform2f(uCenter1, state.trk[1].x, state.trk[1].y);
+      gl.uniform1f(uPulse0,  state.trk[0].pulseAmp);
+      gl.uniform1f(uPulse1,  state.trk[1].pulseAmp);
+      gl.uniform2f(uTip0,    state.trk[0].tipX, state.trk[0].tipY);
+      gl.uniform2f(uTip1,    state.trk[1].tipX, state.trk[1].tipY);
+      gl.uniform1f(uBh0,     state.trk[0].bhStr);
+      gl.uniform1f(uBh1,     state.trk[1].bhStr);
+      gl.uniform2f(uAspect,  canvas.width / canvas.height, 1.0);
+      gl.uniform1f(uTime,    t0);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      updateDebugUI();
+      requestAnimationFrame(render);
+    }
+
+    // ===== Debug overlay =====
+    const hudEl = document.getElementById("hud");
+    const marks = [document.getElementById("handMark0"), document.getElementById("handMark1")];
+    const cols  = [document.getElementById("pulseCol0"), document.getElementById("pulseCol1")];
+    const flashEl = document.getElementById("trigFlash");
+    let lastTrigTime = 0;
+
+    function updateDebugUI() {
+      const t = performance.now();
+      const sinceTrig = lastTrigTime ? ((t - lastTrigTime) / 1000).toFixed(2) + "s ago" : "never";
+      const l = state.trk[0];
+
+      const gOK = l.gripPrime  > 0;
+      const sOK = l.speedPrime > 0;
+      const cOK = l.cooldown === 0;
+      const aOK = l.active;
+      const willFire = aOK && gOK && sOK && cOK;
+
+      hudEl.innerText =
+        `MP: ${state.mpReady ? "READY" : "..."}   HANDS: ${state.hands.length}\n` +
+        `─── HAND 0 ───\n` +
+        `active   : ${aOK ? "YES ✓" : "—   ✗"}\n` +
+        `x        : ${l.x.toFixed(3)}\n` +
+        `vxRaw    : ${(l.vxRaw || 0).toFixed(4)}\n` +
+        `grip     : ${l.grip.toFixed(2)}  peak2s: ${l.peakGrip.toFixed(2)}  thr: ${PULSE_GRIP_THRESHOLD}\n` +
+        `speed    : ${l.speed.toFixed(4)}  peak2s: ${l.peakSpeed.toFixed(4)}  thr: ${PULSE_SPEED_THRESHOLD}\n` +
+        `gripPrime : ${l.gripPrime}/${PRIME_WINDOW_FRAMES}   ${gOK ? "✓" : "✗"}\n` +
+        `speedPrime: ${l.speedPrime}/${PRIME_WINDOW_FRAMES}   ${sOK ? "✓" : "✗"}\n` +
+        `cooldown : ${l.cooldown}   ${cOK ? "✓" : "✗"}\n` +
+        `pulseAmp : ${l.pulseAmp.toFixed(2)}\n` +
+        `─── TRIGGER ───\n` +
+        `will fire: ${willFire ? "█ YES █" : "NO"}\n` +
+        `fires    : ${l.fireCount || 0}\n` +
+        `last     : ${sinceTrig}`;
+      const recentlyFired = lastTrigTime && (t - lastTrigTime) < 400;
+      hudEl.style.borderColor = recentlyFired ? "#f00" : willFire ? "#ff3" : "#0a0";
+      hudEl.style.color       = recentlyFired ? "#faa" : "#0f0";
+
+      // Hand circle markers (in display space — mirror the texture x)
+      for (let i = 0; i < 2; i++) {
+        const tk = state.trk[i];
+        const m = marks[i];
+        if (tk.active) {
+          const dispX = (1 - tk.x) * window.innerWidth;
+          const dispY = tk.y * window.innerHeight;
+          m.style.display = "block";
+          m.style.left = dispX + "px";
+          m.style.top  = dispY + "px";
+          m.classList.toggle("fist", tk.grip > 0.4);
+        } else {
+          m.style.display = "none";
+        }
+
+        // Column indicator (shows where the ripple renders)
+        const c = cols[i];
+        if (tk.pulseAmp > 0.04) {
+          const dispX = (1 - tk.x) * window.innerWidth;
+          c.style.display = "block";
+          c.style.left = dispX + "px";
+          c.style.opacity = Math.min(1, tk.pulseAmp * 1.2);
+        } else {
+          c.style.display = "none";
+        }
+      }
+    }
+
+    function fireTriggerFlash() {
+      lastTrigTime = performance.now();
+      flashEl.style.display = "block";
+      setTimeout(() => flashEl.style.display = "none", 100);
+    }
+
+    // Hook into pulse trigger: patch the actual trigger site to call flash.
+    // Instead of patching, we monitor pulseAmp rising edge here.
+    let prevPulseAmp = [0, 0];
+    setInterval(() => {
+      for (let i = 0; i < 2; i++) {
+        const p0 = prevPulseAmp[i];
+        const p1 = state.trk[i].pulseAmp;
+        if (p1 > 0.95 && p0 < 0.5) fireTriggerFlash();
+        prevPulseAmp[i] = p1;
+      }
+    }, 16);
+
+    // ===== Manual pulse controls =====
+    function manualPulse(atX, atY) {
+      const tk = state.trk[0];
+      tk.pulseAmp = 1.0;
+      tk.x = atX;
+      tk.y = atY;
+      fireTriggerFlash();
+      log("manual pulse at " + atX.toFixed(2));
+    }
+    window.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        manualPulse(state.trk[0].active ? state.trk[0].x : 0.5,
+                    state.trk[0].active ? state.trk[0].y : 0.5);
+      }
+    });
+    canvas.addEventListener("click", (ev) => {
+      // click position → display coords → texture coords (mirror x)
+      const rect = canvas.getBoundingClientRect();
+      const dispX = (ev.clientX - rect.left) / rect.width;
+      const dispY = (ev.clientY - rect.top)  / rect.height;
+      manualPulse(1 - dispX, dispY);
+    });
+
+    // ===== Recording =====
+    const recBtn = document.getElementById("recBtn");
+    const recFmt = document.getElementById("recFmt");
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recMime = "", recExt = "";
+
+    function pickMime() {
+      const candidates = [
+        ["video/mp4;codecs=avc1.42E01E", "mp4"],
+        ["video/mp4;codecs=h264",         "mp4"],
+        ["video/mp4",                     "mp4"],
+        ["video/webm;codecs=vp9",         "webm"],
+        ["video/webm;codecs=vp8",         "webm"],
+        ["video/webm",                    "webm"]
+      ];
+      for (const [m, e] of candidates) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+          return { mime: m, ext: e };
+        }
+      }
+      return { mime: "", ext: "webm" };
+    }
+    function startRec() {
+      const { mime, ext } = pickMime();
+      recMime = mime; recExt = ext;
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (e) {
+        log("rec err: " + e.message);
+        mediaRecorder = new MediaRecorder(stream);
+        recExt = "webm";
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recMime || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `ripple-${Date.now()}.${recExt}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      };
+      mediaRecorder.start();
+      recBtn.classList.add("recording");
+      recBtn.innerText = "■ STOP";
+      recFmt.innerText = recExt.toUpperCase();
+      log("recording " + (recExt || "webm"));
+    }
+    function stopRec() {
+      if (!mediaRecorder) return;
+      mediaRecorder.stop();
+      mediaRecorder = null;
+      recBtn.classList.remove("recording");
+      recBtn.innerText = "● RECORD";
+    }
+    recBtn.addEventListener("click", () => {
+      if (mediaRecorder) stopRec(); else startRec();
+    });
+
+    async function boot() {
+      btn.style.display = "none";
+      try {
+        await startCamera();
+        requestAnimationFrame(() => {
+          recBtn.style.display = "block";
+          const { ext } = pickMime();
+          recFmt.innerText = ext.toUpperCase() + " READY";
+        });
+        render();
+        await startMediaPipe(state.video);
+      } catch (err) {
+        log("ERROR: " + (err.name || "") + " " + err.message);
+        btn.style.display = "block";
+        btn.innerText = "⚠ RETRY";
+      }
+    }
+
+    btn.addEventListener("click", boot);
+    log("click START to begin");
+  </script>
+</body>
+</html>

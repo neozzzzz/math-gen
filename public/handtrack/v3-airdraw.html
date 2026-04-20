@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Air Drawing — Hand Tracking</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    color: #fff;
+  }
+  #webcam {
+    position: fixed; top: 0; left: 0;
+    width: 1px; height: 1px; opacity: 0; pointer-events: none;
+  }
+  canvas { display: block; }
+  #title {
+    position: fixed; top: 20px; left: 120px;
+    font-size: 13px; letter-spacing: 0.25em; color: #aaa;
+    z-index: 10; pointer-events: none;
+  }
+  #hint {
+    position: fixed; top: 20px; right: 30px;
+    font-size: 10px; letter-spacing: 0.15em; color: #666;
+    z-index: 10; pointer-events: none; text-align: right; line-height: 1.7;
+  }
+  #debugLog {
+    position: fixed; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #0f0;
+    padding: 6px 10px; border: 1px solid #333;
+    font-size: 10px; white-space: pre; z-index: 200;
+    max-width: 320px; line-height: 1.5;
+  }
+  #startBtn {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: #fff; color: #000; border: none;
+    padding: 20px 40px; font-size: 16px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 150;
+  }
+  #menuLink {
+    position: fixed; top: 14px; left: 14px;
+    z-index: 250; font: 10px 'Courier New', monospace;
+    letter-spacing: 0.2em; color: #888;
+    text-decoration: none; border: 1px solid #333;
+    padding: 6px 10px; background: rgba(0,0,0,0.4);
+  }
+  #recBtn, #camBtn {
+    position: fixed; bottom: 16px;
+    background: transparent; color: #fff;
+    border: 1px solid #555;
+    padding: 8px 18px; font-size: 11px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 25;
+    transition: all 0.15s;
+  }
+  #recBtn { left: 50%; transform: translateX(10px); }
+  #camBtn { left: 50%; transform: translateX(calc(-100% - 10px)); }
+  #recBtn.recording { background: #c22; border-color: #f44; }
+  #camBtn.active    { background: #252; border-color: #5e5; }
+  #recBtn:hover, #camBtn:hover { border-color: #aaa; }
+  #recFmt {
+    position: fixed; bottom: 18px; left: calc(50% + 110px);
+    font: 9px monospace; color: #555;
+    letter-spacing: 0.2em; z-index: 25;
+  }
+</style>
+</head>
+<body>
+  <a href="index.html" id="menuLink">← MENU</a>
+  <video id="webcam" autoplay playsinline muted></video>
+  <div id="title">AIR DRAWING</div>
+  <div id="hint">
+    DOUBLE-PINCH → DRAW LOCK ON/OFF<br/>
+    EXTEND ANY FINGER → UNLOCK<br/>
+    HOLD PINCH → GRAB &amp; MOVE<br/>
+    HOLD FIST (0.5s) → OPEN → CLEAR
+  </div>
+  <div id="debugLog">booting...</div>
+  <button id="startBtn">▶ START</button>
+  <button id="camBtn" style="display:none">◐ CAM OFF</button>
+  <button id="recBtn" style="display:none">● RECORD</button>
+  <div id="recFmt"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+
+  <script type="module">
+    const dbg = document.getElementById("debugLog");
+    const btn = document.getElementById("startBtn");
+    const logs = [];
+    function log(msg) {
+      logs.push(msg);
+      if (logs.length > 10) logs.shift();
+      dbg.innerText = logs.join("\n");
+      console.log("[boot]", msg);
+    }
+    window.addEventListener("error", (e) => log("ERR: " + e.message));
+    window.addEventListener("unhandledrejection", (e) => log("PROMISE ERR: " + (e.reason?.message || e.reason)));
+
+    const state = {
+      video: null,
+      hands: [],
+      handInfos: [],
+      mpReady: false,
+
+      // drawing state
+      shapes: [],                     // committed stroke objects
+      currentStroke: [null, null],    // per-hand: { points: [...] }
+      grabbed: [null, null],          // per-hand: { shapeId, offsetX, offsetY }
+      scatterParticles: []            // clear animation
+    };
+
+    // MediaPipe hand skeleton (21 landmarks)
+    const HAND_SKELETON = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [5,9],[9,10],[10,11],[11,12],
+      [9,13],[13,14],[14,15],[15,16],
+      [13,17],[17,18],[18,19],[19,20],
+      [0,17]
+    ];
+
+    function dist(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // Straightness ratio: direct_distance(MCP→tip) / sum(segment lengths).
+    // 1.0 = perfectly straight; < ~0.93 = bent.
+    function fingerStraightness(hand, mcp, pip, dip, tip) {
+      const seg = dist(hand[mcp], hand[pip])
+                + dist(hand[pip], hand[dip])
+                + dist(hand[dip], hand[tip]);
+      if (seg < 1e-4) return 0;
+      return dist(hand[mcp], hand[tip]) / seg;
+    }
+
+    function classifyGesture(hand) {
+      if (!hand || hand.length < 21) return { name: "unknown", ext: {}, extendedCount: 0, bentCount: 0 };
+
+      // Per-finger straightness ratio (1.0 = perfectly straight, <0.85 = clearly bent)
+      const idxS   = fingerStraightness(hand, 5,  6,  7,  8);
+      const midS   = fingerStraightness(hand, 9,  10, 11, 12);
+      const ringS  = fingerStraightness(hand, 13, 14, 15, 16);
+      const pinkyS = fingerStraightness(hand, 17, 18, 19, 20);
+
+      // booleans
+      const idxUp     = idxS   > 0.95;
+      const midUp     = midS   > 0.92;
+      const ringUp    = ringS  > 0.92;
+      const pinkyUp   = pinkyS > 0.92;
+      const idxBent   = idxS   < 0.88;
+      const midBent   = midS   < 0.88;
+      const ringBent  = ringS  < 0.88;
+      const pinkyBent = pinkyS < 0.88;
+
+      const extendedCount = +idxUp + +midUp + +ringUp + +pinkyUp;
+      const bentCount     = +idxBent + +midBent + +ringBent + +pinkyBent;
+      const pinchDist     = dist(hand[4], hand[8]);
+
+      // keep ext for backward-compat with grab/other code
+      const ext = {
+        thumb:  dist(hand[4], hand[0]) > dist(hand[2], hand[0]) * 1.1,
+        index:  idxUp, middle: midUp, ring: ringUp, pinky: pinkyUp
+      };
+
+      let name = "unknown";
+      // PINCH FIRST — thumb+index tips touching is a strong signal and visually looks
+      // like "fist" since index is curled. Must take priority over fist detection.
+      if (pinchDist < 0.055) name = "pinch";
+      // FIST: all four non-thumb fingers clearly bent
+      else if (idxBent && midBent && ringBent && pinkyBent) name = "fist";
+      // POINT (draw mode): index clearly straight AND the other 3 fingers clearly bent
+      else if (idxUp && midBent && ringBent && pinkyBent) name = "point";
+      // OPEN: all 4 fingers straight
+      else if (idxUp && midUp && ringUp && pinkyUp) name = "open";
+      else name = "other";
+
+      return { name, ext, pinchDist, extendedCount, bentCount, idxS, midS, ringS, pinkyS };
+    }
+
+    // ===== Camera =====
+    async function startCamera() {
+      log("requesting camera...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      const video = document.getElementById("webcam");
+      video.srcObject = stream;
+      await new Promise(res => video.onloadedmetadata = res);
+      await video.play();
+      log("camera " + video.videoWidth + "x" + video.videoHeight);
+      state.video = video;
+      return video;
+    }
+
+    // ===== MediaPipe =====
+    async function startMediaPipe(video) {
+      log("loading MediaPipe...");
+      const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const { HandLandmarker, FilesetResolver } = mod;
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      state.mpReady = true;
+      log("MediaPipe READY");
+
+      let lastTs = -1;
+      function detect() {
+        if (video.currentTime !== lastTs) {
+          lastTs = video.currentTime;
+          const hr = handLandmarker.detectForVideo(video, performance.now());
+          state.hands = hr.landmarks || [];
+          state.handInfos = state.hands.map(classifyGesture);
+        }
+        requestAnimationFrame(detect);
+      }
+      detect();
+    }
+
+    // ===== p5 sketch =====
+    function startSketch() {
+      log("creating p5 sketch...");
+      new p5((p) => {
+        // gesture smoothing: last N frames per hand (for generic smoothing)
+        const SMOOTH_N = 2;
+        const smoothBuf = [[], []];
+
+        // ===== DRAW LOCK via double-pinch tap =====
+        // - Short pinch (<PINCH_TAP_MAX_MS) + release = "tap"
+        // - Two taps within DOUBLE_TAP_WINDOW_MS = toggle draw lock
+        // - Held pinch (>=PINCH_GRAB_MIN_MS) = grab mode (existing)
+        // - In draw lock: any other finger extending for OTHER_EXIT_FRAMES = auto-unlock
+        const PINCH_TAP_MAX_MS     = 200;
+        const PINCH_GRAB_MIN_MS    = 260;   // slight gap over tap max to avoid overlap
+        const DOUBLE_TAP_WINDOW_MS = 400;
+        const OTHER_EXIT_FRAMES    = 3;
+        const pinchStartAt    = [0, 0];      // 0 = not pinching; else millis when started
+        const lastTapAt       = [0, 0];      // 0 = no pending tap; else millis of first tap
+        const otherExitStreak = [0, 0];
+        const tapFlash        = [0, 0];      // frames remaining to show "TAP 1" hint
+        state.drawingActive   = [false, false];
+
+        // ===== CLEAR: hold fist → open with cooldown =====
+        const FIST_HOLD_FRAMES = 30;   // ~500 ms
+        const OPEN_CONFIRM     = 4;    // ~67 ms
+        const CLEAR_COOLDOWN   = 120;  // 2 s
+        const fistHoldTime  = [0, 0];
+        const openStreak    = [0, 0];
+        const clearCooldown = [0, 0];
+        // Smoothed index-tip position per hand (EMA)
+        const smoothTip = [null, null];
+        // cursor trails (per hand) for the index-tip dot
+        const cursorTrails = [[], []];
+        // sparks spawned while drawing (fire/ember trail)
+        const sparks = [];
+
+        function spawnSpark(x, y) {
+          if (sparks.length > 180) return;
+          sparks.push({
+            x: x + (Math.random() - 0.5) * 6,
+            y: y + (Math.random() - 0.5) * 4,
+            vx: (Math.random() - 0.5) * 0.8,
+            vy: -0.3 - Math.random() * 1.4,
+            life: 24 + Math.random() * 20,
+            maxLife: 44,
+            hue: 12 + Math.random() * 40,           // red → orange
+            size: 0.9 + Math.random() * 1.1
+          });
+        }
+
+        function smoothed(hi, name) {
+          smoothBuf[hi].push(name);
+          if (smoothBuf[hi].length > SMOOTH_N) smoothBuf[hi].shift();
+          const counts = {};
+          for (const n of smoothBuf[hi]) counts[n] = (counts[n] || 0) + 1;
+          let best = name, max = 0;
+          for (const k in counts) if (counts[k] > max) { max = counts[k]; best = k; }
+          return best;
+        }
+
+        p.setup = function () {
+          p.createCanvas(window.innerWidth, window.innerHeight);
+          p.pixelDensity(1);
+          log("p5 setup " + window.innerWidth + "x" + window.innerHeight);
+        };
+
+        p.windowResized = function () {
+          p.resizeCanvas(window.innerWidth, window.innerHeight);
+        };
+
+        p.draw = function () {
+          p.background(0);
+
+          // optional webcam backdrop (toggle via CAM button; default OFF)
+          if (state.camOn && state.video && state.video.videoWidth > 0) {
+            const v = state.video;
+            const vw = p.width;
+            const vh = p.width * (v.videoHeight / v.videoWidth);
+            const vy = (p.height - vh) / 2;
+            p.push();
+            p.drawingContext.save();
+            p.drawingContext.globalAlpha = 0.25;
+            p.drawingContext.translate(p.width, 0);
+            p.drawingContext.scale(-1, 1);
+            p.drawingContext.drawImage(v, 0, vy, vw, vh);
+            p.drawingContext.restore();
+            p.pop();
+          }
+
+          const hands = state.hands || [];
+
+          // process each hand
+          for (let hi = 0; hi < hands.length; hi++) {
+            const hand = hands[hi];
+            if (!hand || hand.length < 21) {
+              commitStrokeIfAny(hi);
+              state.grabbed[hi] = null;
+              smoothBuf[hi].length = 0;
+              smoothTip[hi] = null;
+              pinchStartAt[hi] = 0;
+              lastTapAt[hi] = 0;
+              otherExitStreak[hi] = 0;
+              tapFlash[hi] = 0;
+              fistHoldTime[hi] = 0;
+              openStreak[hi] = 0;
+              state.drawingActive[hi] = false;
+              continue;
+            }
+            const info = classifyGesture(hand);
+            const rawName = info.name;
+            const g = smoothed(hi, rawName);
+
+            // ==== CLEAR: hold-to-charge fist, then open to fire ====
+            if (clearCooldown[hi] > 0) clearCooldown[hi]--;
+
+            if (rawName === "fist") {
+              fistHoldTime[hi]++;
+              openStreak[hi] = 0;
+            } else if (rawName === "open") {
+              openStreak[hi]++;
+              // preserve fist charge during transition — do NOT decay while open
+            } else {
+              // point / pinch / other / unknown — charge slowly drains
+              openStreak[hi] = 0;
+              fistHoldTime[hi] = Math.max(0, fistHoldTime[hi] - 3);
+            }
+
+            if (fistHoldTime[hi] >= FIST_HOLD_FRAMES
+                && openStreak[hi] >= OPEN_CONFIRM
+                && clearCooldown[hi] === 0) {
+              triggerClear();
+              clearCooldown[hi] = CLEAR_COOLDOWN;
+              fistHoldTime[hi]  = 0;
+              openStreak[hi]    = 0;
+              log("cleared (fist held → open)");
+            }
+
+            // ==== DRAW: double-pinch tap to toggle lock ====
+            const now = p.millis();
+            const wasPinching = pinchStartAt[hi] > 0;
+            const nowPinching = rawName === "pinch";
+
+            if (nowPinching && !wasPinching) {
+              pinchStartAt[hi] = now;
+            }
+            if (!nowPinching && wasPinching) {
+              const heldMs = now - pinchStartAt[hi];
+              pinchStartAt[hi] = 0;
+              if (heldMs < PINCH_TAP_MAX_MS) {
+                // tap registered
+                if (lastTapAt[hi] > 0 && (now - lastTapAt[hi]) < DOUBLE_TAP_WINDOW_MS) {
+                  // DOUBLE TAP → toggle draw lock
+                  state.drawingActive[hi] = !state.drawingActive[hi];
+                  lastTapAt[hi]       = 0;
+                  otherExitStreak[hi] = 0;
+                  tapFlash[hi]        = 30;
+                  log("draw " + (state.drawingActive[hi] ? "LOCKED" : "RELEASED"));
+                } else {
+                  lastTapAt[hi] = now;   // remember first tap
+                  tapFlash[hi]  = 45;
+                }
+              }
+            }
+            // Expire stale single-tap
+            if (lastTapAt[hi] > 0 && (now - lastTapAt[hi]) > DOUBLE_TAP_WINDOW_MS) {
+              lastTapAt[hi] = 0;
+            }
+            if (tapFlash[hi] > 0) tapFlash[hi]--;
+
+            // Auto-exit lock: any non-index finger clearly extended for N frames
+            if (state.drawingActive[hi]) {
+              const otherUp = (info.midS > 0.92) || (info.ringS > 0.92) || (info.pinkyS > 0.92);
+              if (otherUp) {
+                otherExitStreak[hi]++;
+                if (otherExitStreak[hi] >= OTHER_EXIT_FRAMES) {
+                  state.drawingActive[hi] = false;
+                  otherExitStreak[hi] = 0;
+                  log("draw auto-OFF (other finger raised)");
+                }
+              } else {
+                otherExitStreak[hi] = 0;
+              }
+            }
+
+            // ==== EMA smoothing of index-tip ====
+            const tip = hand[8];
+            const tipX = (1 - tip.x) * p.width;
+            const tipY = tip.y * p.height;
+            if (!smoothTip[hi]) smoothTip[hi] = { x: tipX, y: tipY };
+            else {
+              smoothTip[hi].x = smoothTip[hi].x * 0.3 + tipX * 0.7;
+              smoothTip[hi].y = smoothTip[hi].y * 0.3 + tipY * 0.7;
+            }
+
+            processDrawing(hi, hand, g);
+            processGrab(hi, hand, g);
+            updateCursorTrail(hi, hand);
+          }
+
+          // update + draw scatter particles (clear effect)
+          updateScatter();
+
+          // draw committed shapes
+          drawShapes();
+
+          // draw current in-progress strokes
+          for (let hi = 0; hi < 2; hi++) {
+            if (state.currentStroke[hi]) {
+              drawStroke(state.currentStroke[hi].points, true);
+            }
+          }
+
+          // draw + update flame sparks
+          updateAndDrawSparks();
+
+          // draw skeletons (dim)
+          for (const hand of hands) drawSkeleton(hand);
+
+          // draw fist-hold progress arc per hand
+          drawFistCharge(hands);
+
+          // draw index-tip cursor trails + brightcursor per hand
+          drawCursors(hands);
+
+          // draw scatter particles ON TOP so the scatter feels like it rises
+          drawScatter();
+
+          // status footer
+          drawFooter(hands);
+        };
+
+        // ==================== helpers ====================
+
+        function commitStrokeIfAny(hi) {
+          const s = state.currentStroke[hi];
+          if (s && s.points.length > 3) {
+            state.shapes.push({
+              id: `s_${Date.now()}_${hi}_${Math.floor(Math.random()*1000)}`,
+              points: s.points,
+              tx: 0, ty: 0
+            });
+          }
+          state.currentStroke[hi] = null;
+        }
+
+        function processDrawing(hi, hand, g) {
+          const st = smoothTip[hi];
+          if (!st) return;
+          const ix = st.x, iy = st.y;
+
+          // Drawing is controlled by hysteresis flag, not the single-frame gesture
+          if (state.drawingActive[hi]) {
+            if (!state.currentStroke[hi]) {
+              state.currentStroke[hi] = { points: [] };
+            }
+            const pts = state.currentStroke[hi].points;
+            const last = pts[pts.length - 1];
+            if (!last || Math.hypot(last.x - ix, last.y - iy) > 3) {
+              pts.push({ x: ix, y: iy });
+            }
+            // mild flame: 1–2 sparks per frame at the drawing tip
+            spawnSpark(ix, iy);
+            if (Math.random() < 0.5) spawnSpark(ix, iy);
+          } else {
+            commitStrokeIfAny(hi);
+          }
+        }
+
+        function updateAndDrawSparks() {
+          const ctx = p.drawingContext;
+          for (let i = sparks.length - 1; i >= 0; i--) {
+            const s = sparks[i];
+            s.x += s.vx;
+            s.y += s.vy;
+            s.vy -= 0.04;                 // buoyant rise
+            s.vx *= 0.97;
+            s.life--;
+            if (s.life <= 0) { sparks.splice(i, 1); continue; }
+            const a = s.life / s.maxLife;
+            ctx.shadowColor = `hsla(${s.hue}, 95%, 60%, ${a})`;
+            ctx.shadowBlur  = 6;
+            ctx.fillStyle   = `hsla(${s.hue}, 95%, 62%, ${a.toFixed(2)})`;
+            ctx.fillRect(s.x, s.y, s.size, s.size);
+          }
+          ctx.shadowBlur = 0;
+        }
+
+        function processGrab(hi, hand, g) {
+          // Disable grab while in draw lock (pinch is reserved for tap-to-toggle)
+          if (state.drawingActive[hi]) {
+            state.grabbed[hi] = null;
+            return;
+          }
+          // Require SUSTAINED pinch (not a quick tap) so it doesn't fire on double-tap
+          const held = pinchStartAt[hi] > 0 ? (p.millis() - pinchStartAt[hi]) : 0;
+          const pinchSustained = g === "pinch" && held >= PINCH_GRAB_MIN_MS;
+          if (!pinchSustained) {
+            state.grabbed[hi] = null;
+            return;
+          }
+          const tb = hand[4], ix = hand[8];
+          const px = (1 - (tb.x + ix.x) / 2) * p.width;
+          const py = ((tb.y + ix.y) / 2) * p.height;
+
+          if (!state.grabbed[hi]) {
+            for (let i = state.shapes.length - 1; i >= 0; i--) {
+              const s = state.shapes[i];
+              if (shapeNearPoint(s, px, py, 80)) {
+                state.grabbed[hi] = {
+                  shapeId: s.id,
+                  offsetX: s.tx - px,
+                  offsetY: s.ty - py
+                };
+                break;
+              }
+            }
+          }
+          if (state.grabbed[hi]) {
+            const s = state.shapes.find(x => x.id === state.grabbed[hi].shapeId);
+            if (s) {
+              s.tx = px + state.grabbed[hi].offsetX;
+              s.ty = py + state.grabbed[hi].offsetY;
+            }
+          }
+        }
+
+        function shapeNearPoint(s, x, y, margin) {
+          const m2 = margin * margin;
+          for (const pt of s.points) {
+            const dx = (pt.x + s.tx) - x;
+            const dy = (pt.y + s.ty) - y;
+            if (dx * dx + dy * dy < m2) return true;
+          }
+          return false;
+        }
+
+        function updateCursorTrail(hi, hand) {
+          const tip = hand[8];
+          if (!tip) return;
+          const x = (1 - tip.x) * p.width;
+          const y = tip.y * p.height;
+          cursorTrails[hi].push({ x, y, t: p.millis() });
+          if (cursorTrails[hi].length > 18) cursorTrails[hi].shift();
+        }
+
+        function triggerClear() {
+          // turn every committed shape into particles
+          for (const s of state.shapes) {
+            for (const pt of s.points) {
+              state.scatterParticles.push({
+                x: pt.x + s.tx,
+                y: pt.y + s.ty,
+                vx: (Math.random() - 0.5) * 6,
+                vy: (Math.random() - 0.5) * 6 - 1.5,
+                life: 90 + Math.random() * 40,
+                maxLife: 130
+              });
+            }
+          }
+          // also current strokes in progress
+          for (let hi = 0; hi < 2; hi++) {
+            const s = state.currentStroke[hi];
+            if (!s) continue;
+            for (const pt of s.points) {
+              state.scatterParticles.push({
+                x: pt.x, y: pt.y,
+                vx: (Math.random() - 0.5) * 6,
+                vy: (Math.random() - 0.5) * 6 - 1.5,
+                life: 90 + Math.random() * 40,
+                maxLife: 130
+              });
+            }
+          }
+          state.shapes = [];
+          state.currentStroke = [null, null];
+          state.grabbed = [null, null];
+          // also unlock drawing so user starts fresh
+          state.drawingActive = [false, false];
+          lastTapAt[0] = lastTapAt[1] = 0;
+          otherExitStreak[0] = otherExitStreak[1] = 0;
+        }
+
+        function updateScatter() {
+          for (let i = state.scatterParticles.length - 1; i >= 0; i--) {
+            const pt = state.scatterParticles[i];
+            pt.x += pt.vx;
+            pt.y += pt.vy;
+            pt.vy += 0.08;              // gravity
+            pt.vx *= 0.985;
+            pt.vy *= 0.985;
+            pt.life--;
+            if (pt.life <= 0) state.scatterParticles.splice(i, 1);
+          }
+        }
+
+        function drawScatter() {
+          const ctx = p.drawingContext;
+          ctx.shadowColor = "#fff";
+          ctx.shadowBlur = 4;
+          for (const pt of state.scatterParticles) {
+            const a = pt.life / pt.maxLife;
+            ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+            ctx.fillRect(pt.x, pt.y, 2, 2);
+          }
+          ctx.shadowBlur = 0;
+        }
+
+        // Draw a polyline as smooth quadratic curves through midpoints.
+        // tx/ty is applied per point (for translated shapes).
+        function strokePath(ctx, pts, tx, ty) {
+          if (pts.length < 2) return;
+          if (pts.length === 2) {
+            ctx.moveTo(pts[0].x + tx, pts[0].y + ty);
+            ctx.lineTo(pts[1].x + tx, pts[1].y + ty);
+            return;
+          }
+          ctx.moveTo(pts[0].x + tx, pts[0].y + ty);
+          for (let i = 1; i < pts.length - 1; i++) {
+            const xc = (pts[i].x + pts[i + 1].x) / 2 + tx;
+            const yc = (pts[i].y + pts[i + 1].y) / 2 + ty;
+            ctx.quadraticCurveTo(pts[i].x + tx, pts[i].y + ty, xc, yc);
+          }
+          const last = pts[pts.length - 1];
+          const prev = pts[pts.length - 2];
+          // finish last segment with a quadratic from prev through last
+          ctx.quadraticCurveTo(prev.x + tx, prev.y + ty, last.x + tx, last.y + ty);
+        }
+
+        function drawShapes() {
+          const ctx = p.drawingContext;
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          const grabbedIds = new Set(
+            state.grabbed.filter(Boolean).map(g => g.shapeId)
+          );
+          for (const s of state.shapes) {
+            const isGrabbed = grabbedIds.has(s.id);
+            ctx.lineWidth = isGrabbed ? 2.8 : 2.4;
+            ctx.strokeStyle = isGrabbed ? "#ff5fbf" : "rgba(255,255,255,0.94)";
+            ctx.shadowColor = isGrabbed ? "#ff5fbf" : "#ffffff";
+            ctx.shadowBlur = isGrabbed ? 12 : 3;
+            ctx.beginPath();
+            strokePath(ctx, s.points, s.tx, s.ty);
+            ctx.stroke();
+          }
+          ctx.shadowBlur = 0;
+        }
+
+        function drawStroke(points, isActive) {
+          if (points.length < 2) return;
+          const ctx = p.drawingContext;
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 2.6;
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          ctx.shadowColor = "#ffffff";
+          ctx.shadowBlur = isActive ? 8 : 2;
+          ctx.beginPath();
+          strokePath(ctx, points, 0, 0);
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+        }
+
+        function drawSkeleton(hand) {
+          if (!hand || hand.length < 21) return;
+          const ctx = p.drawingContext;
+          ctx.strokeStyle = "rgba(255,255,255,0.32)";
+          ctx.lineWidth = 1;
+          for (const [a, b] of HAND_SKELETON) {
+            const p1 = hand[a], p2 = hand[b];
+            if (!p1 || !p2) continue;
+            const ax = (1 - p1.x) * p.width;
+            const ay = p1.y * p.height;
+            const bx = (1 - p2.x) * p.width;
+            const by = p2.y * p.height;
+            ctx.beginPath();
+            ctx.moveTo(ax, ay); ctx.lineTo(bx, by);
+            ctx.stroke();
+          }
+          // small dim dots at each joint (NOT on index tip — that gets the bright cursor)
+          ctx.fillStyle = "rgba(255,255,255,0.45)";
+          for (let j = 0; j < 21; j++) {
+            if (j === 8) continue;
+            const lm = hand[j];
+            if (!lm) continue;
+            const x = (1 - lm.x) * p.width;
+            const y = lm.y * p.height;
+            ctx.beginPath();
+            ctx.arc(x, y, 2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        function drawFistCharge(hands) {
+          const ctx = p.drawingContext;
+          for (let hi = 0; hi < hands.length; hi++) {
+            const hand = hands[hi];
+            if (!hand || !hand[9]) continue;
+            const hold = fistHoldTime[hi];
+            if (hold < 5 && clearCooldown[hi] === 0) continue;
+
+            // center on middle-finger MCP (landmark 9) = palm center-ish
+            const cx = (1 - hand[9].x) * p.width;
+            const cy = hand[9].y * p.height;
+            const r  = 42;
+
+            if (clearCooldown[hi] > 0) {
+              // brief confirmation glow after clearing
+              const a = clearCooldown[hi] / CLEAR_COOLDOWN;
+              ctx.strokeStyle = `rgba(110,255,160,${a.toFixed(2)})`;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.arc(cx, cy, r + (1 - a) * 20, 0, Math.PI * 2);
+              ctx.stroke();
+              continue;
+            }
+
+            const progress = Math.min(1, hold / FIST_HOLD_FRAMES);
+            const ready = progress >= 1;
+
+            // background ring (dim)
+            ctx.strokeStyle = "rgba(255,255,255,0.15)";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.stroke();
+
+            // charging arc
+            ctx.strokeStyle = ready ? "rgba(255,220,140,0.9)" : "rgba(255,255,255,0.75)";
+            ctx.lineWidth = ready ? 3 : 2;
+            ctx.shadowColor = ready ? "rgba(255,200,120,0.9)" : "rgba(255,255,255,0.5)";
+            ctx.shadowBlur = ready ? 10 : 4;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + progress * Math.PI * 2);
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            // label
+            p.noStroke();
+            p.fill(ready ? "#ffd98a" : "rgba(255,255,255,0.75)");
+            p.textFont("Courier New");
+            p.textSize(10);
+            p.textAlign(p.CENTER, p.TOP);
+            p.text(ready ? "OPEN HAND → CLEAR" : `HOLD FIST  ${Math.round(progress * 100)}%`,
+                   cx, cy + r + 8);
+          }
+        }
+
+        function drawCursors(hands) {
+          const ctx = p.drawingContext;
+          for (let hi = 0; hi < hands.length; hi++) {
+            const hand = hands[hi];
+            if (!hand || !hand[8]) continue;
+            const info = state.handInfos[hi];
+            const g = info?.name || "unknown";
+
+            // cursor trail (fading)
+            const trail = cursorTrails[hi];
+            for (let i = 0; i < trail.length - 1; i++) {
+              const a = trail[i], b = trail[i + 1];
+              const alpha = (i / trail.length) * 0.4;
+              ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+              ctx.stroke();
+            }
+
+            const ix = (1 - hand[8].x) * p.width;
+            const iy = hand[8].y * p.height;
+
+            // cursor appearance depends on mode
+            let coreColor, glow;
+            if (g === "point")      { coreColor = "#ffffff"; glow = 24; }
+            else if (g === "pinch") { coreColor = "#ff5fbf"; glow = 20; }
+            else if (g === "fist")  { coreColor = "#888";    glow = 6; }
+            else                     { coreColor = "#ffffff"; glow = 10; }
+
+            ctx.shadowColor = coreColor;
+            ctx.shadowBlur = glow;
+            ctx.fillStyle = coreColor;
+            ctx.beginPath();
+            ctx.arc(ix, iy, g === "point" ? 6 : 4, 0, Math.PI * 2);
+            ctx.fill();
+            // hot white core
+            ctx.shadowBlur = 6;
+            ctx.shadowColor = "#fff";
+            ctx.fillStyle = "rgba(255,255,255,0.95)";
+            ctx.beginPath();
+            ctx.arc(ix, iy, 1.4, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+
+            // label
+            p.noStroke();
+            p.fill(200, 200);
+            p.textFont("Courier New");
+            p.textSize(10);
+            p.textAlign(p.CENTER, p.TOP);
+            const label =
+              state.drawingActive[hi]           ? "🔒 DRAW LOCKED" :
+              tapFlash[hi] > 0 && lastTapAt[hi] ? "TAP 1 / 2" :
+              g === "pinch"                     ? "PINCH" :
+              g === "fist"                      ? "FIST" :
+              g === "open"                      ? "MOVE" : "—";
+            p.text(label, ix, iy + 14);
+
+            // grab marker
+            if (state.grabbed[hi]) {
+              p.noFill(); p.stroke(255, 95, 191);
+              p.strokeWeight(1);
+              p.circle(ix, iy, 30);
+            }
+          }
+        }
+
+        function drawFooter(hands) {
+          p.noStroke();
+          p.fill(255, 130);
+          p.textFont("Courier New");
+          p.textSize(10);
+          p.textAlign(p.CENTER, p.BOTTOM);
+          const active = state.shapes.length;
+          const drawing = state.currentStroke.filter(Boolean).length;
+          const charging = fistHoldTime.some(t => t > 5 && t < FIST_HOLD_FRAMES);
+          const ready    = fistHoldTime.some(t => t >= FIST_HOLD_FRAMES);
+          const suffix   = ready    ? " · FIST READY → OPEN TO CLEAR"
+                         : charging ? " · CHARGING FIST…"
+                         : "";
+          p.text(
+            `${active} OBJECTS · ${drawing ? "DRAWING..." : "IDLE"} · HANDS ${hands.length}/2${suffix}`,
+            p.width / 2, p.height - 54
+          );
+        }
+      });
+    }
+
+    // ===== Camera visibility toggle (default OFF) =====
+    const camBtn = document.getElementById("camBtn");
+    state.camOn = false;
+    camBtn.addEventListener("click", () => {
+      state.camOn = !state.camOn;
+      camBtn.innerText = state.camOn ? "◉ CAM ON" : "◐ CAM OFF";
+      camBtn.classList.toggle("active", state.camOn);
+    });
+
+    // ===== Recording (MP4 preferred, webm fallback) =====
+    const recBtn = document.getElementById("recBtn");
+    const recFmt = document.getElementById("recFmt");
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recMime = "", recExt = "";
+
+    function pickMime() {
+      const candidates = [
+        ["video/mp4;codecs=avc1.42E01E", "mp4"],
+        ["video/mp4;codecs=h264",         "mp4"],
+        ["video/mp4",                     "mp4"],
+        ["video/webm;codecs=vp9",         "webm"],
+        ["video/webm;codecs=vp8",         "webm"],
+        ["video/webm",                    "webm"]
+      ];
+      for (const [m, e] of candidates) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+          return { mime: m, ext: e };
+        }
+      }
+      return { mime: "", ext: "webm" };
+    }
+
+    function startRec() {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) { log("no canvas yet"); return; }
+      const { mime, ext } = pickMime();
+      recMime = mime; recExt = ext;
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (e) {
+        log("rec err: " + e.message);
+        mediaRecorder = new MediaRecorder(stream);
+        recExt = "webm";
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recMime || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `airdraw-${Date.now()}.${recExt}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      };
+      mediaRecorder.start();
+      recBtn.classList.add("recording");
+      recBtn.innerText = "■ STOP";
+      recFmt.innerText = recExt.toUpperCase();
+      log("recording " + (recExt || "webm"));
+    }
+    function stopRec() {
+      if (!mediaRecorder) return;
+      mediaRecorder.stop();
+      mediaRecorder = null;
+      recBtn.classList.remove("recording");
+      recBtn.innerText = "● RECORD";
+    }
+    recBtn.addEventListener("click", () => {
+      if (mediaRecorder) stopRec(); else startRec();
+    });
+
+    async function boot() {
+      btn.style.display = "none";
+      try {
+        await startCamera();
+        startSketch();
+        // after canvas exists, show rec/cam buttons + show which format will be used
+        requestAnimationFrame(() => {
+          recBtn.style.display = "block";
+          camBtn.style.display = "block";
+          const { ext } = pickMime();
+          recFmt.innerText = ext.toUpperCase() + " READY";
+        });
+        await startMediaPipe(state.video);
+      } catch (err) {
+        log("ERROR: " + (err.name || "") + " " + err.message);
+        btn.style.display = "block";
+        btn.innerText = "⚠ RETRY";
+      }
+    }
+
+    btn.addEventListener("click", boot);
+    log("click START to begin");
+  </script>
+</body>
+</html>

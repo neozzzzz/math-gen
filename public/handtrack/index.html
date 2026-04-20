@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Hand Tracking Art · Versions</title>
+<style>
+  :root {
+    --fg: #eaeaea;
+    --dim: #888;
+    --line: #333;
+    --accent: #ff3366;
+    --bg: #000;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100vh;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    overflow-x: hidden;
+  }
+  body {
+    padding: 56px 40px 120px;
+  }
+
+  /* ----- header ----- */
+  header { margin-bottom: 60px; max-width: 1100px; }
+  .kicker {
+    font-size: 11px;
+    letter-spacing: 0.3em;
+    color: var(--dim);
+    margin-bottom: 10px;
+  }
+  h1 {
+    font-size: clamp(28px, 4.2vw, 56px);
+    letter-spacing: 0.15em;
+    font-weight: 400;
+    margin: 0 0 14px;
+  }
+  .sub {
+    font-size: 12px;
+    letter-spacing: 0.15em;
+    color: var(--dim);
+    max-width: 560px;
+    line-height: 1.7;
+  }
+  .divider {
+    height: 1px; background: var(--line);
+    margin: 34px 0 30px;
+  }
+
+  /* ----- cards grid ----- */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 18px;
+    max-width: 1400px;
+  }
+  .card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    background: #0a0a0a;
+    border: 1px solid var(--line);
+    padding: 22px 22px 24px;
+    cursor: pointer;
+    text-decoration: none;
+    color: inherit;
+    min-height: 260px;
+    transition: border-color 0.15s, transform 0.15s, background 0.15s;
+  }
+  .card:hover {
+    border-color: #fff;
+    background: #0e0e0e;
+  }
+  .card::before, .card::after {
+    content: ""; position: absolute;
+    width: 14px; height: 14px;
+    border: 1px solid var(--fg);
+    opacity: 0.4;
+  }
+  .card::before { top: 6px; left: 6px; border-right: none; border-bottom: none; }
+  .card::after  { bottom: 6px; right: 6px; border-left: none; border-top: none; }
+  .card:hover::before, .card:hover::after { opacity: 1; }
+
+  .card .num {
+    position: absolute; top: 16px; right: 18px;
+    font-size: 10px; letter-spacing: 0.2em;
+    color: var(--dim);
+  }
+  .card .key {
+    position: absolute; top: 14px; right: 60px;
+    font-size: 10px; letter-spacing: 0.15em;
+    color: var(--dim);
+    border: 1px solid var(--line);
+    padding: 2px 6px;
+  }
+  .card canvas {
+    width: 100%; height: 120px;
+    margin-bottom: 16px;
+    background: #000;
+    border: 1px solid #1a1a1a;
+  }
+  .card h2 {
+    font-size: 14px;
+    letter-spacing: 0.18em;
+    margin: 0 0 6px;
+    font-weight: 400;
+  }
+  .card .tagline {
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    color: var(--accent);
+    margin-bottom: 10px;
+  }
+  .card p {
+    font-size: 11px;
+    line-height: 1.7;
+    color: var(--dim);
+    margin: 0;
+    letter-spacing: 0.05em;
+  }
+
+  /* ----- placeholder "coming soon" card ----- */
+  .card.placeholder {
+    background: transparent;
+    border-style: dashed;
+    color: var(--dim);
+    cursor: default;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+  }
+  .card.placeholder:hover {
+    border-color: #666;
+    background: transparent;
+  }
+  .card.placeholder .plus {
+    font-size: 28px; margin-bottom: 10px;
+  }
+
+  /* ----- footer ----- */
+  footer {
+    position: fixed; bottom: 22px; left: 40px;
+    font-size: 10px; color: var(--dim);
+    letter-spacing: 0.15em;
+  }
+  footer .keys span {
+    border: 1px solid var(--line);
+    padding: 2px 6px;
+    margin-right: 4px;
+  }
+
+  /* ----- corner brackets on page ----- */
+  .page-brackets { position: fixed; pointer-events: none; z-index: 5; }
+  .page-brackets svg {
+    position: fixed; width: 28px; height: 28px;
+    stroke: var(--fg); stroke-width: 1; fill: none;
+    opacity: 0.5;
+  }
+  .pb-tl { top: 16px; left: 16px; }
+  .pb-tr { top: 16px; right: 16px; transform: scaleX(-1); }
+  .pb-bl { bottom: 16px; left: 16px; transform: scaleY(-1); }
+  .pb-br { bottom: 16px; right: 16px; transform: scale(-1, -1); }
+  .red-dot {
+    position: fixed; top: 22px; left: 22px;
+    width: 6px; height: 6px; background: var(--accent);
+    z-index: 6;
+  }
+</style>
+</head>
+<body>
+
+<!-- page corner brackets -->
+<svg class="page-brackets pb-tl"><path d="M0,14 L0,0 L14,0"/></svg>
+<svg class="page-brackets pb-tr"><path d="M0,14 L0,0 L14,0"/></svg>
+<svg class="page-brackets pb-bl"><path d="M0,14 L0,0 L14,0"/></svg>
+<svg class="page-brackets pb-br"><path d="M0,14 L0,0 L14,0"/></svg>
+<div class="red-dot"></div>
+
+<header>
+  <div class="kicker">HAND TRACKING · MEDIA ART</div>
+  <h1>VERSIONS INDEX</h1>
+  <div class="sub">
+    an evolving set of browser-based hand-tracking experiments.<br/>
+    each version is a self-contained sketch — mediapipe + p5.js.<br/>
+    pick a version below to run it full screen.
+  </div>
+  <div class="divider"></div>
+</header>
+
+<main class="grid" id="grid"></main>
+
+<footer>
+  <div class="keys">
+    QUICKSELECT · <span>1</span><span>2</span><span>…</span> &nbsp;&nbsp; esc: return here
+  </div>
+</footer>
+
+<script>
+  // ============================================================
+  //  VERSION REGISTRY
+  //  Add a new entry here to expose another sketch.
+  //  Each `preview(ctx, w, h, t)` paints the card thumbnail.
+  //  t = millis() for animations.
+  // ============================================================
+  const VERSIONS = [
+    {
+      num: 1,
+      title: "TOPOLOGIES OF THOUGHTS",
+      tagline: "PARTICLE FIELD · 3 MODES · FACE OPTIONAL",
+      description:
+        "700 1-px dots flow between 5 fingertips. Three modes: centralized, decentralized, distributed. Pinch to switch. Optional face tracking with blink/wink reactions.",
+      file: "v1-topologies.html",
+      preview: (ctx, w, h, t) => {
+        // radial starburst preview
+        ctx.fillStyle = "#000"; ctx.fillRect(0,0,w,h);
+        const cx = w/2, cy = h/2;
+        const rays = 18;
+        for (let i=0; i<rays; i++) {
+          const a = (i / rays) * Math.PI * 2 + t * 0.0002;
+          const r = 40 + Math.sin(t*0.001 + i) * 4;
+          const ex = cx + Math.cos(a)*r;
+          const ey = cy + Math.sin(a)*r;
+          ctx.strokeStyle = "rgba(255,255,255,0.8)";
+          ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(ex-1, ey-1, 2, 2);
+        }
+        ctx.fillStyle = "#fff";
+        ctx.beginPath(); ctx.arc(cx, cy, 2.5, 0, Math.PI*2); ctx.fill();
+        // corner marker
+        ctx.fillStyle = "#ff3366";
+        ctx.fillRect(6, 6, 3, 3);
+      }
+    },
+    {
+      num: 2,
+      title: "ELASTIC STRINGS",
+      tagline: "21 JOINTS · 108 CROSS-STRINGS · GLOW",
+      description:
+        "Every hand joint becomes a glowing colored node. 108 cross-hand strings connect pairs of joints, always unbreakable. Pinch = pluck with pentatonic harp tone.",
+      file: "v2-strings.html",
+      preview: (ctx, w, h, t) => {
+        ctx.fillStyle = "#000"; ctx.fillRect(0,0,w,h);
+        // two clusters of glowing dots with strings between
+        const leftPts = [];
+        const rightPts = [];
+        for (let i=0; i<7; i++) {
+          const ay = 25 + i*10 + Math.sin(t*0.001 + i) * 2;
+          leftPts.push({ x: 40 + Math.cos(i*1.2 + t*0.0008)*6, y: ay, hue: 310 + i*6 });
+          rightPts.push({ x: w - 40 + Math.cos(i*1.2 - t*0.0008)*6, y: ay, hue: 120 + i*10 });
+        }
+        // strings
+        ctx.lineWidth = 0.7;
+        for (let i=0; i<7; i++) {
+          for (let j=0; j<7; j++) {
+            if ((i+j) % 2 === 0) continue;
+            const a = leftPts[i], b = rightPts[j];
+            const midHue = (a.hue + b.hue) / 2;
+            ctx.strokeStyle = `hsla(${midHue}, 90%, 68%, 0.6)`;
+            ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+          }
+        }
+        // glowing dots
+        for (const pts of [leftPts, rightPts]) {
+          for (const pt of pts) {
+            ctx.shadowColor = `hsl(${pt.hue}, 95%, 65%)`;
+            ctx.shadowBlur = 10;
+            ctx.fillStyle = `hsl(${pt.hue}, 95%, 65%)`;
+            ctx.beginPath(); ctx.arc(pt.x, pt.y, 2.5, 0, Math.PI*2); ctx.fill();
+          }
+        }
+        ctx.shadowBlur = 0;
+      }
+    },
+    {
+      num: 3,
+      title: "AIR DRAWING",
+      tagline: "POINT TO DRAW · PINCH TO MOVE · FIST→OPEN TO CLEAR",
+      description:
+        "Hand skeleton with a bright cursor on the index fingertip. Extend only the index to draw in air; pinch thumb-to-index to grab and reposition a shape; clench then open to scatter everything into particles.",
+      file: "v3-airdraw.html",
+      preview: (ctx, w, h, t) => {
+        ctx.fillStyle = "#000"; ctx.fillRect(0,0,w,h);
+        // animated drawn-line figure: spiral
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = 1.8;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.shadowColor = "#fff";
+        ctx.shadowBlur = 5;
+        const cx = w/2, cy = h/2;
+        const phase = t * 0.0015;
+        ctx.beginPath();
+        for (let a = 0; a < Math.PI * 6; a += 0.1) {
+          const r = a * 3;
+          const x = cx + Math.cos(a + phase) * r;
+          const y = cy + Math.sin(a + phase) * r;
+          if (a === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        // index-tip cursor at spiral end
+        const endA = Math.PI * 6;
+        const er = endA * 3;
+        const ex = cx + Math.cos(endA + phase) * er;
+        const ey = cy + Math.sin(endA + phase) * er;
+        ctx.shadowColor = "#fff";
+        ctx.shadowBlur = 14;
+        ctx.fillStyle = "#fff";
+        ctx.beginPath(); ctx.arc(ex, ey, 4, 0, Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    },
+    {
+      num: 4,
+      title: "NEBULA GENERATOR",
+      tagline: "FIST → OPEN = BIRTH · COSMIC PALETTE",
+      description:
+        "Hold a fist for 0.3s then open your hand — a new nebula is born at your palm. Spirals, globular clusters, and diffuse clouds in shifting purples, cyans and magentas. Up to 20 nebulas drift together.",
+      file: "v4-nebulas.html",
+      preview: (ctx, w, h, t) => {
+        ctx.fillStyle = "#04050f"; ctx.fillRect(0, 0, w, h);
+        // background stars
+        for (let i = 0; i < 40; i++) {
+          const x = (i * 73 + 137) % w;
+          const y = (i * 29 + 211) % h;
+          const tw = 0.5 + Math.sin(t * 0.001 + i) * 0.5;
+          ctx.fillStyle = `rgba(255,255,255,${(0.35 * tw).toFixed(2)})`;
+          ctx.fillRect(x, y, 1, 1);
+        }
+        // Three mini nebulas
+        const layout = [
+          { cx: w * 0.28, cy: h * 0.55, hue: 285, R: 32, type: "spiral" },
+          { cx: w * 0.60, cy: h * 0.35, hue: 195, R: 26, type: "globular" },
+          { cx: w * 0.80, cy: h * 0.68, hue: 335, R: 28, type: "diffuse" }
+        ];
+        for (const n of layout) {
+          // haze
+          const g = ctx.createRadialGradient(n.cx, n.cy, 0, n.cx, n.cy, n.R);
+          g.addColorStop(0,   `hsla(${n.hue}, 85%, 55%, 0.45)`);
+          g.addColorStop(0.5, `hsla(${n.hue}, 85%, 55%, 0.15)`);
+          g.addColorStop(1,   `hsla(${n.hue}, 85%, 55%, 0)`);
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(n.cx, n.cy, n.R, 0, Math.PI * 2);
+          ctx.fill();
+          // stars
+          const pts = n.type === "spiral" ? 18 : n.type === "globular" ? 22 : 16;
+          const rot = t * 0.0003 + n.hue;
+          for (let i = 0; i < pts; i++) {
+            let px, py;
+            if (n.type === "spiral") {
+              const f = i / pts;
+              const a = f * Math.PI * 2.2 + rot;
+              const r = f * n.R * 0.9;
+              px = n.cx + Math.cos(a) * r;
+              py = n.cy + Math.sin(a) * r;
+            } else if (n.type === "globular") {
+              const a = (i / pts) * Math.PI * 2 + rot * 0.5;
+              const r = Math.sqrt((i % 7) / 7) * n.R * 0.7;
+              px = n.cx + Math.cos(a) * r;
+              py = n.cy + Math.sin(a) * r;
+            } else {
+              const a = (i / pts) * Math.PI * 2;
+              const r = n.R * (0.3 + 0.6 * ((i * 13) % 100) / 100);
+              px = n.cx + Math.cos(a) * r;
+              py = n.cy + Math.sin(a) * r;
+            }
+            ctx.shadowColor = `hsl(${n.hue}, 95%, 70%)`;
+            ctx.shadowBlur = 6;
+            ctx.fillStyle = `hsl(${n.hue + ((i * 7) % 20 - 10)}, 95%, 78%)`;
+            ctx.beginPath();
+            ctx.arc(px, py, 1.3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.shadowBlur = 0;
+        }
+      }
+    },
+    {
+      num: 5,
+      title: "DOMAIN WARP",
+      tagline: "GRIP SPACE · WEBGL SHADER · CHROMATIC",
+      description:
+        "Jujutsu-Kaisen-style space distortion. Webcam is rendered through a WebGL shader; making a fist grips the space around your hand — swirl + pinch + RGB chromatic aberration + glitch shear. Squeeze harder to warp reality.",
+      file: "v5-domainwarp.html",
+      preview: (ctx, w, h, t) => {
+        ctx.fillStyle = "#111"; ctx.fillRect(0, 0, w, h);
+        const cx = w * 0.5, cy = h * 0.55;
+        const phase = t * 0.0018;
+        const strength = 0.55 + Math.sin(phase) * 0.25;
+        ctx.strokeStyle = "#e0e0e0";
+        ctx.lineWidth = 0.5;
+        const cols = 14, rows = 10;
+        for (let r = 0; r <= rows; r++) {
+          ctx.beginPath();
+          for (let c = 0; c <= cols; c++) {
+            const u = c / cols, v = r / rows;
+            let x = u * w, y = v * h;
+            const dx = x - cx, dy = y - cy;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            const falloff = Math.max(0, 1 - dist / (w * 0.5));
+            const a = Math.atan2(dy, dx) + strength * falloff * 3.0 + phase;
+            const r2 = dist * (1 - strength * falloff * 0.5);
+            const nx = cx + Math.cos(a) * r2;
+            const ny = cy + Math.sin(a) * r2;
+            if (c === 0) ctx.moveTo(nx, ny); else ctx.lineTo(nx, ny);
+          }
+          ctx.stroke();
+        }
+        for (let c = 0; c <= cols; c++) {
+          ctx.beginPath();
+          for (let r = 0; r <= rows; r++) {
+            const u = c / cols, v = r / rows;
+            let x = u * w, y = v * h;
+            const dx = x - cx, dy = y - cy;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            const falloff = Math.max(0, 1 - dist / (w * 0.5));
+            const a = Math.atan2(dy, dx) + strength * falloff * 3.0 + phase;
+            const r2 = dist * (1 - strength * falloff * 0.5);
+            const nx = cx + Math.cos(a) * r2;
+            const ny = cy + Math.sin(a) * r2;
+            if (r === 0) ctx.moveTo(nx, ny); else ctx.lineTo(nx, ny);
+          }
+          ctx.stroke();
+        }
+        ctx.shadowColor = "#f44"; ctx.shadowBlur = 8;
+        ctx.fillStyle = "rgba(255,80,80,0.9)";
+        ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "rgba(255,60,60,0.35)";
+        ctx.fillRect(cx - 50, cy - 30, 1, 60);
+        ctx.fillStyle = "rgba(60,120,255,0.35)";
+        ctx.fillRect(cx + 50, cy - 30, 1, 60);
+      }
+    },
+    {
+      num: 6,
+      title: "VERTICAL RIPPLE",
+      tagline: "FIST → WATER COLUMN · MOVE L/R TO SHIMMER",
+      description:
+        "A variation of Domain Warp. Making a fist creates a vertical column of shimmering water at the hand's position. Moving the fist side-to-side drags the shimmer and adds speed-driven amplitude — like a reflection rippling.",
+      file: "v6-ripple.html",
+      preview: (ctx, w, h, t) => {
+        ctx.fillStyle = "#081018"; ctx.fillRect(0, 0, w, h);
+        // faint horizontal stripes (like a wall behind water)
+        for (let y = 0; y < h; y += 4) {
+          ctx.fillStyle = `rgba(180,200,220,${(0.05 + (y % 8 === 0 ? 0.04 : 0)).toFixed(2)})`;
+          ctx.fillRect(0, y, w, 1);
+        }
+        // vertical ripple column centered
+        const phase = t * 0.004;
+        const cx = w * 0.5 + Math.sin(t * 0.0015) * w * 0.15;
+        const colWidth = w * 0.22;
+        // render stripes inside column shifted by sine
+        for (let y = 0; y < h; y += 2) {
+          const wave = Math.sin(y * 0.35 + phase * 2) * 6
+                     + Math.sin(y * 0.15 - phase * 1.3) * 4;
+          const dx = Math.abs(0 - cx);
+          const hFall = Math.max(0, 1 - Math.abs(cx - cx) / colWidth);
+          // Column shifted by wave
+          ctx.fillStyle = `rgba(150,200,230,${(0.5 + (y % 6 === 0 ? 0.25 : 0)).toFixed(2)})`;
+          ctx.fillRect(cx - colWidth/2 + wave, y, colWidth, 1);
+        }
+        // fist marker
+        ctx.shadowColor = "#88c"; ctx.shadowBlur = 10;
+        ctx.fillStyle = "rgba(180,200,240,0.95)";
+        ctx.beginPath(); ctx.arc(cx, h * 0.6, 5, 0, Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    },
+    {
+      num: 7,
+      title: "SATORU",
+      tagline: "4 CURSED TECHNIQUES · 20K PARTICLES · BLOOM",
+      description:
+        "Jujutsu-Kaisen cursed techniques as hand gestures. Pinch = Hollow Purple, peace = Infinite Void, index up = Red, open palm = Malevolent Shrine. 20,000 additive particles morph through Three.js + UnrealBloom, with a distinct SFX per technique.",
+      file: "v7-satoru.html",
+      preview: (ctx, w, h, t) => {
+        ctx.fillStyle = "#05030a"; ctx.fillRect(0, 0, w, h);
+        // faint stars
+        for (let i = 0; i < 30; i++) {
+          const x = (i * 53 + 91) % w;
+          const y = (i * 23 + 147) % h;
+          ctx.fillStyle = `rgba(255,255,255,${0.2 + ((i*7)%5)*0.05})`;
+          ctx.fillRect(x, y, 1, 1);
+        }
+        // pulsing purple singularity (Hollow Purple)
+        const cx = w * 0.5, cy = h * 0.52;
+        const phase = t * 0.002;
+        const pulse = 0.85 + Math.sin(phase * 3) * 0.15;
+        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, 38 * pulse);
+        g.addColorStop(0,   `rgba(210,170,255,${0.9 * pulse})`);
+        g.addColorStop(0.3, `rgba(150,100,255,${0.55 * pulse})`);
+        g.addColorStop(1,   "rgba(90,50,200,0)");
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 38 * pulse, 0, Math.PI * 2);
+        ctx.fill();
+        // additive particles swirl
+        ctx.globalCompositeOperation = "lighter";
+        for (let i = 0; i < 90; i++) {
+          const a = (i * 0.7) + phase * 2;
+          const r = 6 + ((i * 13) % 30);
+          const px = cx + Math.cos(a) * r;
+          const py = cy + Math.sin(a) * r * 0.85;
+          const hueShift = (i * 5) % 60;
+          ctx.fillStyle = `hsla(${265 + hueShift}, 90%, 70%, 0.9)`;
+          ctx.fillRect(px, py, 1.2, 1.2);
+        }
+        // three red spiral arms (Red)
+        ctx.strokeStyle = "rgba(255,60,60,0.45)";
+        ctx.lineWidth = 0.8;
+        for (let arm = 0; arm < 3; arm++) {
+          ctx.beginPath();
+          for (let f = 0; f <= 1; f += 0.05) {
+            const a = f * Math.PI * 2 * 1.6 + arm * (Math.PI * 2 / 3) - phase;
+            const rr = 4 + f * 40;
+            const px = cx + Math.cos(a) * rr;
+            const py = cy + Math.sin(a) * rr * 0.85;
+            if (f === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+        }
+        ctx.globalCompositeOperation = "source-over";
+        // corner cyan hint (Infinite Void)
+        ctx.fillStyle = "rgba(127,216,255,0.8)";
+        ctx.fillRect(8, h - 10, 3, 3);
+      }
+    }
+    // NEW VERSIONS GO HERE — just append entries
+  ];
+
+  // ============================================================
+  //  Render cards
+  // ============================================================
+  const grid = document.getElementById("grid");
+  const previewCanvases = []; // { canvas, ctx, preview }
+
+  VERSIONS.forEach((v, i) => {
+    const a = document.createElement("a");
+    a.className = "card";
+    a.href = v.file;
+    a.innerHTML = `
+      <div class="num">V${String(v.num).padStart(2,"0")}</div>
+      <div class="key">${i + 1}</div>
+      <canvas></canvas>
+      <h2>${v.title}</h2>
+      <div class="tagline">${v.tagline}</div>
+      <p>${v.description}</p>
+    `;
+    grid.appendChild(a);
+
+    const canvas = a.querySelector("canvas");
+    // set canvas intrinsic size to match CSS size for crisp rendering
+    requestAnimationFrame(() => {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width;
+      canvas.height = rect.height;
+    });
+    previewCanvases.push({ canvas, preview: v.preview });
+  });
+
+  // placeholder "add new" card
+  const placeholder = document.createElement("div");
+  placeholder.className = "card placeholder";
+  placeholder.innerHTML = `
+    <div class="plus">+</div>
+    <div style="font-size:10px;letter-spacing:0.2em;">NEW VERSION<br/>COMING SOON</div>
+  `;
+  grid.appendChild(placeholder);
+
+  // ============================================================
+  //  Animate previews
+  // ============================================================
+  function tick() {
+    const t = performance.now();
+    for (const { canvas, preview } of previewCanvases) {
+      if (!canvas.width || !canvas.height) continue;
+      const ctx = canvas.getContext("2d");
+      preview(ctx, canvas.width, canvas.height, t);
+    }
+    requestAnimationFrame(tick);
+  }
+  window.addEventListener("resize", () => {
+    for (const { canvas } of previewCanvases) {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width  = rect.width;
+      canvas.height = rect.height;
+    }
+  });
+  tick();
+
+  // ============================================================
+  //  Keyboard quick-select (1-9)
+  // ============================================================
+  window.addEventListener("keydown", (e) => {
+    if (e.key >= "1" && e.key <= "9") {
+      const n = parseInt(e.key, 10);
+      if (VERSIONS[n - 1]) window.location.href = VERSIONS[n - 1].file;
+    }
+  });
+</script>
+</body>
+</html>

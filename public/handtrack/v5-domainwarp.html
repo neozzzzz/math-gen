@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Domain Warp — Hand Tracking</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    color: #fff;
+  }
+  #webcam { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #glCanvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  #title {
+    position: fixed; top: 20px; left: 120px;
+    font-size: 13px; letter-spacing: 0.25em; color: #aaa;
+    z-index: 10; pointer-events: none;
+  }
+  #hint {
+    position: fixed; top: 20px; right: 30px;
+    font-size: 10px; letter-spacing: 0.15em; color: #666;
+    z-index: 10; pointer-events: none; text-align: right; line-height: 1.7;
+  }
+  #debugLog {
+    position: fixed; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #0f0;
+    padding: 6px 10px; border: 1px solid #333;
+    font-size: 10px; white-space: pre; z-index: 200;
+    max-width: 320px; line-height: 1.5;
+  }
+  #startBtn {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: #fff; color: #000; border: none;
+    padding: 20px 40px; font-size: 16px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 150;
+  }
+  #menuLink {
+    position: fixed; top: 14px; left: 14px;
+    z-index: 250; font: 10px 'Courier New', monospace;
+    letter-spacing: 0.2em; color: #aaa;
+    text-decoration: none; border: 1px solid #444;
+    padding: 6px 10px; background: rgba(0,0,0,0.5);
+  }
+  #recBtn {
+    position: fixed; bottom: 16px; left: 50%;
+    transform: translateX(-50%);
+    background: transparent; color: #fff;
+    border: 1px solid #555;
+    padding: 8px 18px; font-size: 11px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 25;
+    transition: all 0.15s;
+  }
+  #recBtn.recording { background: #c22; border-color: #f44; }
+  #recBtn:hover { border-color: #aaa; }
+  #recFmt {
+    position: fixed; bottom: 18px; left: calc(50% + 110px);
+    font: 9px monospace; color: #555;
+    letter-spacing: 0.2em; z-index: 25;
+  }
+</style>
+</head>
+<body>
+  <a href="index.html" id="menuLink">← MENU</a>
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="glCanvas"></canvas>
+  <div id="title">DOMAIN WARP</div>
+  <div id="hint">
+    MAKE A FIST TO GRIP SPACE<br/>
+    SQUEEZE HARDER FOR DEEPER WARP
+  </div>
+  <div id="debugLog">booting...</div>
+  <button id="startBtn">▶ START</button>
+  <button id="recBtn" style="display:none">● RECORD</button>
+  <div id="recFmt"></div>
+
+  <script type="module">
+    const dbg = document.getElementById("debugLog");
+    const btn = document.getElementById("startBtn");
+    const logs = [];
+    function log(msg) {
+      logs.push(msg);
+      if (logs.length > 10) logs.shift();
+      dbg.innerText = logs.join("\n");
+      console.log("[boot]", msg);
+    }
+    window.addEventListener("error", (e) => log("ERR: " + e.message));
+    window.addEventListener("unhandledrejection", (e) => log("PROMISE ERR: " + (e.reason?.message || e.reason)));
+
+    // ===== Shader source =====
+    const VERT_SRC = `
+      attribute vec2 a_position;
+      varying vec2 vUv;
+      void main() {
+        // full-screen quad: a_position in [-1,1]
+        vec2 uv = (a_position + 1.0) * 0.5;
+        // mirror X (selfie cam) + flip Y (texture is upside down vs clip-space)
+        vUv = vec2(1.0 - uv.x, 1.0 - uv.y);
+        gl_Position = vec4(a_position, 0.0, 1.0);
+      }
+    `;
+    const FRAG_SRC = `
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D uVideo;
+      uniform vec2  uCenter0;
+      uniform vec2  uCenter1;
+      uniform float uGrip0;
+      uniform float uGrip1;
+      uniform float uTime;
+      uniform vec2  uVideoAspect; // (videoW/dispW, videoH/dispH) to correct distance
+      uniform vec2  uContain;     // scale factor to cover/contain video in display
+
+      // Gripping a point in space: swirls + pinches UV around a center.
+      vec2 warpAt(vec2 uv, vec2 center, float grip) {
+        // work in aspect-corrected space so distortion is circular on any canvas
+        vec2 d = (uv - center) * uContain;
+        float r = length(d);
+        float falloff = smoothstep(0.45, 0.0, r);
+        if (falloff < 0.001 || grip < 0.005) return uv;
+        float swirl = grip * falloff * 3.6;
+        float a = atan(d.y, d.x) + swirl;
+        float pinch = 1.0 - grip * falloff * 0.55;
+        vec2 dp = vec2(cos(a), sin(a)) * r * pinch;
+        // back to uv space
+        return center + dp / uContain;
+      }
+
+      void main() {
+        vec2 uv = vUv;
+        uv = warpAt(uv, uCenter0, uGrip0);
+        uv = warpAt(uv, uCenter1, uGrip1);
+
+        float totalGrip = uGrip0 + uGrip1;
+        float ab = totalGrip * 0.018;
+
+        // chromatic aberration along vector from center of screen
+        vec2 dir = normalize(uv - vec2(0.5) + 1e-6);
+
+        // slight shear at peak grip — glitch feel
+        float shear = totalGrip * 0.018 * sin(uTime * 9.0 + uv.y * 22.0);
+
+        vec2 uvR = uv + dir * ab     + vec2(shear, 0.0);
+        vec2 uvG = uv;
+        vec2 uvB = uv - dir * ab     - vec2(shear, 0.0);
+
+        // keep UVs inside the valid region to avoid seams
+        uvR = clamp(uvR, 0.0, 1.0);
+        uvG = clamp(uvG, 0.0, 1.0);
+        uvB = clamp(uvB, 0.0, 1.0);
+
+        float r = texture2D(uVideo, uvR).r;
+        float g = texture2D(uVideo, uvG).g;
+        float b = texture2D(uVideo, uvB).b;
+        vec3 col = vec3(r, g, b);
+
+        // subtle vignette, darker as grip increases
+        float vig = smoothstep(1.3, 0.2, length(uv - vec2(0.5)) * (1.5 + totalGrip * 0.6));
+        col *= mix(1.0, vig, 0.4 + totalGrip * 0.3);
+
+        // mood: pull black point slightly
+        col = clamp((col - 0.02) * 1.03, 0.0, 1.0);
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    // ===== WebGL setup =====
+    const canvas = document.getElementById("glCanvas");
+    const gl = canvas.getContext("webgl", { antialias: false, premultipliedAlpha: false });
+    if (!gl) { log("WebGL not available"); throw new Error("no webgl"); }
+
+    function compile(type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const err = gl.getShaderInfoLog(sh);
+        log("shader err: " + err);
+        throw new Error(err);
+      }
+      return sh;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER,   VERT_SRC));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG_SRC));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      log("link err: " + gl.getProgramInfoLog(prog));
+      throw new Error("link failed");
+    }
+    gl.useProgram(prog);
+
+    const aPos = gl.getAttribLocation(prog, "a_position");
+    const uVideo      = gl.getUniformLocation(prog, "uVideo");
+    const uCenter0    = gl.getUniformLocation(prog, "uCenter0");
+    const uCenter1    = gl.getUniformLocation(prog, "uCenter1");
+    const uGrip0      = gl.getUniformLocation(prog, "uGrip0");
+    const uGrip1      = gl.getUniformLocation(prog, "uGrip1");
+    const uTime       = gl.getUniformLocation(prog, "uTime");
+    const uContain    = gl.getUniformLocation(prog, "uContain");
+
+    // full-screen quad
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+      -1,-1,  1,-1,  -1, 1,
+      -1, 1,  1,-1,   1, 1
+    ]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    // video texture
+    const videoTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, videoTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    function resizeCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width  = Math.floor(window.innerWidth  * dpr);
+      canvas.height = Math.floor(window.innerHeight * dpr);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    // ===== State =====
+    const state = {
+      video: null,
+      hands: [],
+      handInfos: [],
+      mpReady: false,
+      // smoothed per-hand: position + grip
+      trk: [
+        { x: 0.5, y: 0.5, grip: 0, active: false },
+        { x: 0.5, y: 0.5, grip: 0, active: false }
+      ]
+    };
+
+    // ===== Camera =====
+    async function startCamera() {
+      log("requesting camera...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      const video = document.getElementById("webcam");
+      video.srcObject = stream;
+      await new Promise(res => video.onloadedmetadata = res);
+      await video.play();
+      log("camera " + video.videoWidth + "x" + video.videoHeight);
+      state.video = video;
+      return video;
+    }
+
+    // ===== Gesture: grip strength from fingertip distance =====
+    function computeGrip(hand) {
+      // Average distance of 4 fingertips (8,12,16,20) to palm (landmark 0)
+      // Normalized to 0 (fist) .. 1 (fully open)
+      const w = hand[0];
+      let sum = 0;
+      const tips = [8, 12, 16, 20];
+      for (const t of tips) {
+        const dx = hand[t].x - w.x;
+        const dy = hand[t].y - w.y;
+        sum += Math.sqrt(dx * dx + dy * dy);
+      }
+      const avg = sum / 4;
+      // empirical thresholds: open ~0.30, fist ~0.10
+      const openT = 0.28;
+      const fistT = 0.12;
+      const openness = Math.max(0, Math.min(1, (avg - fistT) / (openT - fistT)));
+      return 1.0 - openness;  // grip = 1 when fist, 0 when open
+    }
+
+    // ===== MediaPipe =====
+    async function startMediaPipe(video) {
+      log("loading MediaPipe...");
+      const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const { HandLandmarker, FilesetResolver } = mod;
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      state.mpReady = true;
+      log("MediaPipe READY");
+
+      let lastTs = -1;
+      function detect() {
+        if (video.currentTime !== lastTs) {
+          lastTs = video.currentTime;
+          const hr = handLandmarker.detectForVideo(video, performance.now());
+          state.hands = hr.landmarks || [];
+        }
+        requestAnimationFrame(detect);
+      }
+      detect();
+    }
+
+    // ===== Main render loop =====
+    function render() {
+      const t0 = performance.now() / 1000;
+
+      // Upload webcam frame as texture
+      const v = state.video;
+      if (v && v.videoWidth > 0) {
+        gl.bindTexture(gl.TEXTURE_2D, videoTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, v);
+      }
+
+      // Update per-hand tracking (smoothed)
+      for (let i = 0; i < 2; i++) state.trk[i].active = false;
+      for (let i = 0; i < Math.min(2, state.hands.length); i++) {
+        const h = state.hands[i];
+        if (!h || h.length < 21) continue;
+        const palm = h[9];  // middle finger MCP ≈ palm center
+        // mirror x because display is mirrored
+        const px = 1 - palm.x;
+        const py = palm.y;
+        const grip = computeGrip(h);
+        const tk = state.trk[i];
+        // EMA smoothing
+        tk.x    = tk.active ? tk.x    * 0.7 + px   * 0.3 : px;
+        tk.y    = tk.active ? tk.y    * 0.7 + py   * 0.3 : py;
+        tk.grip = tk.active ? tk.grip * 0.55 + grip * 0.45 : grip;
+        tk.active = true;
+      }
+      // Decay grip for inactive slots so warp releases smoothly
+      for (let i = 0; i < 2; i++) {
+        if (!state.trk[i].active) state.trk[i].grip *= 0.85;
+      }
+
+      // Set uniforms
+      gl.uniform1i(uVideo, 0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, videoTex);
+      gl.uniform2f(uCenter0, state.trk[0].x, state.trk[0].y);
+      gl.uniform2f(uCenter1, state.trk[1].x, state.trk[1].y);
+      gl.uniform1f(uGrip0,   state.trk[0].grip);
+      gl.uniform1f(uGrip1,   state.trk[1].grip);
+      gl.uniform1f(uTime,    t0);
+
+      // aspect correction: keep warp circular regardless of screen ratio
+      const arScreen = canvas.width / canvas.height;
+      // we scale x by aspect ratio inside the shader's distance calc
+      gl.uniform2f(uContain, arScreen, 1.0);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      requestAnimationFrame(render);
+    }
+
+    // ===== Recording =====
+    const recBtn = document.getElementById("recBtn");
+    const recFmt = document.getElementById("recFmt");
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recMime = "", recExt = "";
+
+    function pickMime() {
+      const candidates = [
+        ["video/mp4;codecs=avc1.42E01E", "mp4"],
+        ["video/mp4;codecs=h264",         "mp4"],
+        ["video/mp4",                     "mp4"],
+        ["video/webm;codecs=vp9",         "webm"],
+        ["video/webm;codecs=vp8",         "webm"],
+        ["video/webm",                    "webm"]
+      ];
+      for (const [m, e] of candidates) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+          return { mime: m, ext: e };
+        }
+      }
+      return { mime: "", ext: "webm" };
+    }
+    function startRec() {
+      const { mime, ext } = pickMime();
+      recMime = mime; recExt = ext;
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (e) {
+        log("rec err: " + e.message);
+        mediaRecorder = new MediaRecorder(stream);
+        recExt = "webm";
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recMime || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `domainwarp-${Date.now()}.${recExt}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      };
+      mediaRecorder.start();
+      recBtn.classList.add("recording");
+      recBtn.innerText = "■ STOP";
+      recFmt.innerText = recExt.toUpperCase();
+      log("recording " + (recExt || "webm"));
+    }
+    function stopRec() {
+      if (!mediaRecorder) return;
+      mediaRecorder.stop();
+      mediaRecorder = null;
+      recBtn.classList.remove("recording");
+      recBtn.innerText = "● RECORD";
+    }
+    recBtn.addEventListener("click", () => {
+      if (mediaRecorder) stopRec(); else startRec();
+    });
+
+    async function boot() {
+      btn.style.display = "none";
+      try {
+        await startCamera();
+        requestAnimationFrame(() => {
+          recBtn.style.display = "block";
+          const { ext } = pickMime();
+          recFmt.innerText = ext.toUpperCase() + " READY";
+        });
+        render();
+        await startMediaPipe(state.video);
+      } catch (err) {
+        log("ERROR: " + (err.name || "") + " " + err.message);
+        btn.style.display = "block";
+        btn.innerText = "⚠ RETRY";
+      }
+    }
+
+    btn.addEventListener("click", boot);
+    log("click START to begin");
+  </script>
+</body>
+</html>

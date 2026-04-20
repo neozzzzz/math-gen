@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<title>Elastic Strings — Hand Mesh</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    overflow: hidden;
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Courier New', monospace;
+    color: #fff;
+  }
+  #webcam {
+    position: fixed; top: 0; left: 0;
+    width: 1px; height: 1px; opacity: 0; pointer-events: none;
+  }
+  canvas { display: block; }
+  #title {
+    position: fixed; top: 20px; left: 120px;
+    font-size: 13px; letter-spacing: 0.25em; color: #aaa;
+    z-index: 10; pointer-events: none;
+  }
+  #hint {
+    position: fixed; top: 20px; right: 30px;
+    font-size: 10px; letter-spacing: 0.15em; color: #666;
+    z-index: 10; pointer-events: none; text-align: right;
+  }
+  #debugLog {
+    position: fixed; bottom: 8px; right: 8px;
+    background: rgba(0,0,0,0.6); color: #0f0;
+    padding: 6px 10px; border: 1px solid #333;
+    font-size: 10px; white-space: pre; z-index: 200;
+    max-width: 320px; line-height: 1.5;
+  }
+  #startBtn {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%,-50%);
+    background: #fff; color: #000; border: none;
+    padding: 20px 40px; font-size: 16px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 150;
+  }
+  #recBtn, #camBtn {
+    position: fixed; bottom: 16px;
+    background: transparent; color: #fff;
+    border: 1px solid #555;
+    padding: 8px 18px; font-size: 11px;
+    font-family: monospace; letter-spacing: 0.2em;
+    cursor: pointer; z-index: 25;
+    transition: all 0.15s;
+  }
+  #recBtn { left: 50%; transform: translateX(10px); }
+  #camBtn { left: 50%; transform: translateX(calc(-100% - 10px)); }
+  #recBtn.recording { background: #c22; border-color: #f44; }
+  #camBtn.active    { background: #252; border-color: #5e5; }
+  #recBtn:hover, #camBtn:hover { border-color: #aaa; }
+  #recFmt {
+    position: fixed; bottom: 18px; left: calc(50% + 110px);
+    font: 9px monospace; color: #555;
+    letter-spacing: 0.2em; z-index: 25;
+  }
+</style>
+</head>
+<body>
+  <a href="index.html" id="menuLink" style="position:fixed;top:14px;left:14px;z-index:250;font:10px 'Courier New',monospace;letter-spacing:0.2em;color:#888;text-decoration:none;border:1px solid #333;padding:6px 10px;background:rgba(0,0,0,0.4);">← MENU</a>
+  <video id="webcam" autoplay playsinline muted></video>
+  <div id="title">ELASTIC STRINGS</div>
+  <div id="hint">SHOW BOTH HANDS<br/>PINCH TO PLUCK</div>
+  <div id="debugLog">booting...</div>
+  <button id="startBtn">▶ START</button>
+  <button id="camBtn" style="display:none">◉ CAM ON</button>
+  <button id="recBtn" style="display:none">● RECORD</button>
+  <div id="recFmt"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+
+  <script type="module">
+    const dbg = document.getElementById("debugLog");
+    const btn = document.getElementById("startBtn");
+    const logs = [];
+    function log(msg) {
+      logs.push(msg);
+      if (logs.length > 10) logs.shift();
+      dbg.innerText = logs.join("\n");
+      console.log("[boot]", msg);
+    }
+    window.addEventListener("error", (e) => log("ERR: " + e.message));
+    window.addEventListener("unhandledrejection", (e) => log("PROMISE ERR: " + (e.reason?.message || e.reason)));
+
+    const state = {
+      video: null,
+      hands: [],
+      handInfos: [],
+      mpReady: false
+    };
+
+    // ===== Audio =====
+    let audioCtx = null;
+    function initAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const PENTA = [220.0, 261.6, 293.7, 329.6, 392.0, 440.0, 523.3, 587.3, 659.3, 783.99];
+    function playTone(freq, vol = 0.06, dur = 0.8, type = "triangle") {
+      if (!audioCtx) return;
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      osc.connect(g); g.connect(audioCtx.destination);
+      g.gain.setValueAtTime(0, audioCtx.currentTime);
+      g.gain.linearRampToValueAtTime(vol, audioCtx.currentTime + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+      osc.start();
+      osc.stop(audioCtx.currentTime + dur + 0.02);
+    }
+    // ===== Camera =====
+    async function startCamera() {
+      log("requesting camera...");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }
+      });
+      const video = document.getElementById("webcam");
+      video.srcObject = stream;
+      await new Promise(res => video.onloadedmetadata = res);
+      await video.play();
+      log("camera " + video.videoWidth + "x" + video.videoHeight);
+      state.video = video;
+      return video;
+    }
+
+    // ===== Gesture detection (pinch only) =====
+    function classifyGesture(hand) {
+      if (!hand || hand.length < 21) return { name: "unknown", pinchDist: 1 };
+      const dx = hand[4].x - hand[8].x;
+      const dy = hand[4].y - hand[8].y;
+      const pinchDist = Math.sqrt(dx * dx + dy * dy);
+      return { name: pinchDist < 0.05 ? "pinch" : "open", pinchDist };
+    }
+
+    // ===== MediaPipe =====
+    async function startMediaPipe(video) {
+      log("loading MediaPipe...");
+      const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+      const { HandLandmarker, FilesetResolver } = mod;
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      state.mpReady = true;
+      log("MediaPipe READY");
+
+      let lastTs = -1;
+      function detect() {
+        if (video.currentTime !== lastTs) {
+          lastTs = video.currentTime;
+          const hr = handLandmarker.detectForVideo(video, performance.now());
+          state.hands = hr.landmarks || [];
+          state.handInfos = state.hands.map(classifyGesture);
+        }
+        requestAnimationFrame(detect);
+      }
+      detect();
+    }
+
+    // ===== constants =====
+    // Standard MediaPipe hand skeleton connections (21 landmarks)
+    const HAND_SKELETON = [
+      // thumb
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      // index
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      // middle
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      // ring
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      // pinky
+      [13, 17], [17, 18], [18, 19], [19, 20],
+      // palm outer edge
+      [0, 17]
+    ];
+    const STRING_COUNT = 108;
+
+    // ===== p5 sketch =====
+    function startSketch() {
+      log("creating p5 sketch...");
+      new p5((p) => {
+        // Pre-computed cross-hand pairs (deterministic)
+        const crossPairs = [];
+        // Use seeded-style indices: spread across joint combinations
+        for (let i = 0; i < STRING_COUNT; i++) {
+          const a = Math.floor(((i * 7) + (i * i * 3)) % 21);
+          const b = Math.floor(((i * 13) + (i * i * 5) + 11) % 21);
+          crossPairs.push([a, b]);
+        }
+        // Add extra random pairs for variety
+        while (crossPairs.length < STRING_COUNT) {
+          crossPairs.push([
+            Math.floor(Math.random() * 21),
+            Math.floor(Math.random() * 21)
+          ]);
+        }
+
+        // pinch / pluck state
+        let pluckCool = [0, 0];
+        let lastPinch = [false, false];
+        let pluckAmp = 0;
+
+        p.setup = function () {
+          p.createCanvas(window.innerWidth, window.innerHeight);
+          p.pixelDensity(1);
+          log("p5 setup " + window.innerWidth + "x" + window.innerHeight);
+        };
+
+        p.windowResized = function () {
+          p.resizeCanvas(window.innerWidth, window.innerHeight);
+        };
+
+        p.draw = function () {
+          p.background(0);
+
+          // dim webcam backdrop (togglable)
+          if (state.camOn && state.video && state.video.videoWidth > 0) {
+            const v = state.video;
+            const vw = p.width;
+            const vh = p.width * (v.videoHeight / v.videoWidth);
+            const vy = (p.height - vh) / 2;
+            p.push();
+            p.drawingContext.save();
+            p.drawingContext.globalAlpha = 0.35;
+            p.drawingContext.translate(p.width, 0);
+            p.drawingContext.scale(-1, 1);
+            p.drawingContext.drawImage(v, 0, vy, vw, vh);
+            p.drawingContext.restore();
+            p.pop();
+          }
+
+          const hands = state.hands || [];
+          const infos = state.handInfos || [];
+
+          // pluck handling
+          for (let hi = 0; hi < hands.length; hi++) {
+            const info = infos[hi];
+            if (!info) continue;
+            const isPinch = info.name === "pinch";
+            if (isPinch && !lastPinch[hi] && pluckCool[hi] <= 0) {
+              initAudio();
+              pluckAmp = 30;
+              const h = hands[hi];
+              const baseY = h && h[9] ? h[9].y : 0.5;
+              const note = PENTA[Math.floor((1 - baseY) * PENTA.length) % PENTA.length];
+              playTone(note, 0.07, 0.9, "triangle");
+              setTimeout(() => playTone(note * 1.5, 0.035, 0.5, "sine"), 40);
+              pluckCool[hi] = 20;
+            }
+            lastPinch[hi] = isPinch;
+            if (pluckCool[hi] > 0) pluckCool[hi]--;
+          }
+          pluckAmp *= 0.92;
+
+          // --- cross-hand elastic strings ---
+          if (hands.length >= 2) {
+            drawCrossStrings(hands[0], hands[1]);
+          }
+
+          // --- colored glowing joints ---
+          drawJoints(hands);
+
+          // --- one-hand hint ---
+          if (hands.length === 1) {
+            p.noStroke();
+            p.fill(255, 120);
+            p.textFont("Courier New");
+            p.textSize(13);
+            p.textAlign(p.CENTER, p.CENTER);
+            p.text("SHOW SECOND HAND TO FORM STRINGS", p.width / 2, p.height / 2);
+          }
+
+          // --- corner brackets ---
+          drawCornerBrackets();
+
+          // --- footer status ---
+          drawFooter();
+        };
+
+        function jointHue(handIdx, jointIdx) {
+          // Hand 0 (pink/magenta palette): 290..350
+          // Hand 1 (yellow/cyan palette): 60..200
+          if (handIdx === 0) return (290 + jointIdx * 3) % 360;
+          return (60 + jointIdx * 7) % 360;
+        }
+
+        function drawCrossStrings(handA, handB) {
+          if (!handA || !handB || handA.length < 21 || handB.length < 21) return;
+          const ctx = p.drawingContext;
+          ctx.lineWidth = 0.7;
+
+          for (let i = 0; i < crossPairs.length; i++) {
+            const [ai, bi] = crossPairs[i];
+            const pa = handA[ai], pb = handB[bi];
+            if (!pa || !pb) continue;
+            const ax = (1 - pa.x) * p.width;
+            const ay = pa.y * p.height;
+            const bx = (1 - pb.x) * p.width;
+            const by = pb.y * p.height;
+
+            const dx = bx - ax, dy = by - ay;
+            const len = Math.sqrt(dx * dx + dy * dy);
+
+            // vibration from pluck
+            let mx = (ax + bx) / 2;
+            let my = (ay + by) / 2;
+            if (pluckAmp > 1) {
+              const nx = -dy / (len + 1);
+              const ny = dx / (len + 1);
+              const vib = Math.sin(p.millis() * 0.03 + i * 0.8) * pluckAmp;
+              mx += nx * vib;
+              my += ny * vib;
+            }
+
+            const hA = jointHue(0, ai);
+            const hB = jointHue(1, bi);
+            const midHue = (hA + hB) / 2;
+
+            // Alpha eases slightly with distance but never breaks
+            const alpha = p.constrain(0.85 - len / 4000, 0.35, 0.85);
+
+            ctx.strokeStyle = `hsla(${midHue}, 90%, 68%, ${alpha.toFixed(2)})`;
+            ctx.beginPath();
+            ctx.moveTo(ax, ay);
+            if (pluckAmp > 1) {
+              ctx.quadraticCurveTo(mx, my, bx, by);
+            } else {
+              ctx.lineTo(bx, by);
+            }
+            ctx.stroke();
+          }
+        }
+
+        function drawJoints(hands) {
+          const ctx = p.drawingContext;
+          // subtle pulsation so dots feel alive
+          const pulse = 1 + Math.sin(p.millis() * 0.004) * 0.15;
+
+          for (let hi = 0; hi < hands.length; hi++) {
+            const h = hands[hi];
+            if (!h || h.length < 21) continue;
+            for (let j = 0; j < 21; j++) {
+              const lm = h[j];
+              if (!lm) continue;
+              const x = (1 - lm.x) * p.width;
+              const y = lm.y * p.height;
+              const hue = jointHue(hi, j);
+              const color     = `hsl(${hue}, 95%, 62%)`;
+              const softColor = `hsla(${hue}, 100%, 70%, 0.55)`;
+              const aura      = `hsla(${hue}, 100%, 75%, 0.25)`;
+
+              // ----- 3-layer glow -----
+              // outer soft aura
+              ctx.shadowColor = color;
+              ctx.shadowBlur = 34 * pulse;
+              ctx.fillStyle = aura;
+              ctx.beginPath();
+              ctx.arc(x, y, 9 * pulse, 0, Math.PI * 2);
+              ctx.fill();
+
+              // mid glow
+              ctx.shadowBlur = 22 * pulse;
+              ctx.fillStyle = softColor;
+              ctx.beginPath();
+              ctx.arc(x, y, 5 * pulse, 0, Math.PI * 2);
+              ctx.fill();
+
+              // saturated dot
+              ctx.shadowBlur = 14;
+              ctx.fillStyle = color;
+              ctx.beginPath();
+              ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+              ctx.fill();
+
+              // hot white core (lens-flare-ish)
+              ctx.shadowBlur = 8;
+              ctx.shadowColor = "#ffffff";
+              ctx.fillStyle = "rgba(255,255,255,0.98)";
+              ctx.beginPath();
+              ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
+          ctx.shadowBlur = 0;
+        }
+
+        function drawCornerBrackets() {
+          const m = 40, len = 20;
+          const ctx = p.drawingContext;
+          ctx.strokeStyle = "rgba(255,255,255,0.6)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(m, m + len); ctx.lineTo(m, m); ctx.lineTo(m + len, m);
+          ctx.moveTo(p.width - m - len, m); ctx.lineTo(p.width - m, m); ctx.lineTo(p.width - m, m + len);
+          ctx.moveTo(m, p.height - m - len); ctx.lineTo(m, p.height - m); ctx.lineTo(m + len, p.height - m);
+          ctx.moveTo(p.width - m - len, p.height - m); ctx.lineTo(p.width - m, p.height - m); ctx.lineTo(p.width - m, p.height - m - len);
+          ctx.stroke();
+        }
+
+        function drawFooter() {
+          p.noStroke();
+          p.fill(255, 140);
+          p.textFont("Courier New");
+          p.textSize(10);
+          p.textAlign(p.CENTER, p.BOTTOM);
+          const status = state.hands.length < 2
+            ? `${STRING_COUNT} STRINGS AWAITING — BRING TWO HANDS`
+            : `${STRING_COUNT} STRINGS CONNECTED — PINCH TO PLUCK`;
+          p.text(status, p.width / 2, p.height - 24);
+        }
+      });
+    }
+
+    // ===== Camera visibility toggle (default ON for this version) =====
+    const camBtn = document.getElementById("camBtn");
+    state.camOn = true;
+    camBtn.addEventListener("click", () => {
+      state.camOn = !state.camOn;
+      camBtn.innerText = state.camOn ? "◉ CAM ON" : "◐ CAM OFF";
+      camBtn.classList.toggle("active", state.camOn);
+    });
+    camBtn.classList.add("active");
+
+    // ===== Recording (MP4 preferred, webm fallback) =====
+    const recBtn = document.getElementById("recBtn");
+    const recFmt = document.getElementById("recFmt");
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let recMime = "", recExt = "";
+
+    function pickMime() {
+      const candidates = [
+        ["video/mp4;codecs=avc1.42E01E", "mp4"],
+        ["video/mp4;codecs=h264",         "mp4"],
+        ["video/mp4",                     "mp4"],
+        ["video/webm;codecs=vp9",         "webm"],
+        ["video/webm;codecs=vp8",         "webm"],
+        ["video/webm",                    "webm"]
+      ];
+      for (const [m, e] of candidates) {
+        if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)) {
+          return { mime: m, ext: e };
+        }
+      }
+      return { mime: "", ext: "webm" };
+    }
+
+    function startRec() {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return;
+      const { mime, ext } = pickMime();
+      recMime = mime; recExt = ext;
+      const stream = canvas.captureStream(30);
+      recordedChunks = [];
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(stream, { mimeType: mime })
+          : new MediaRecorder(stream);
+      } catch (e) {
+        log("rec err: " + e.message);
+        mediaRecorder = new MediaRecorder(stream);
+        recExt = "webm";
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(recordedChunks, { type: recMime || "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `strings-${Date.now()}.${recExt}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      };
+      mediaRecorder.start();
+      recBtn.classList.add("recording");
+      recBtn.innerText = "■ STOP";
+      recFmt.innerText = recExt.toUpperCase();
+      log("recording " + (recExt || "webm"));
+    }
+    function stopRec() {
+      if (!mediaRecorder) return;
+      mediaRecorder.stop();
+      mediaRecorder = null;
+      recBtn.classList.remove("recording");
+      recBtn.innerText = "● RECORD";
+    }
+    recBtn.addEventListener("click", () => {
+      if (mediaRecorder) stopRec(); else startRec();
+    });
+
+    async function boot() {
+      btn.style.display = "none";
+      initAudio();
+      try {
+        await startCamera();
+        startSketch();
+        requestAnimationFrame(() => {
+          recBtn.style.display = "block";
+          camBtn.style.display = "block";
+          const { ext } = pickMime();
+          recFmt.innerText = ext.toUpperCase() + " READY";
+        });
+        await startMediaPipe(state.video);
+      } catch (err) {
+        log("ERROR: " + (err.name || "") + " " + err.message);
+        btn.style.display = "block";
+        btn.innerText = "⚠ RETRY";
+      }
+    }
+
+    btn.addEventListener("click", boot);
+    log("click START to begin");
+  </script>
+</body>
+</html>
